@@ -22,6 +22,10 @@ import {
 import { assertPaperOnlyEnvironment } from '../safety/paper-only';
 import { assertShadowReady } from '../safety/shadow-readiness';
 import { assertTrustedShadowPnlRecord } from '../safety/trusted-shadow-ledger';
+import {
+  runPublicDataPreflight,
+  type PublicDataPreflightResult,
+} from './network-preflight';
 
 export const SHADOW_V1_SIZES_USD = [10, 25, 50, 100, 250, 500, 1000] as const;
 export const SHADOW_V1_LATENCIES_MS = [0, 100, 250, 500, 1000, 2000, 3000, 5000] as const;
@@ -74,6 +78,8 @@ export interface TrustedShadowConfig {
   latenciesMs?: readonly number[];
   resume?: boolean;
   fetchTimeoutMs?: number;
+  preflightAttempts?: number;
+  preflightBackoffMs?: number;
 }
 
 export interface ShadowStats {
@@ -142,6 +148,7 @@ export interface RunManifest {
   stopReasons: string[];
   processStarts: ProcessStart[];
   recoveredIncompleteEventRanges: Array<{ fromSequence: number; toSequence: number; recoveredAt: string }>;
+  networkPreflight?: PublicDataPreflightResult;
 }
 
 interface BookObservation {
@@ -206,6 +213,8 @@ function manifestConfig(config: TrustedShadowConfig): RunManifest['config'] {
     safetySlippageBps: config.safetySlippageBps, staleAfterMs: config.staleAfterMs,
     maxPairGapMs: config.maxPairGapMs, sizesUsd: config.sizesUsd,
     latenciesMs: config.latenciesMs, fetchTimeoutMs: config.fetchTimeoutMs,
+    preflightAttempts: config.preflightAttempts,
+    preflightBackoffMs: config.preflightBackoffMs,
   };
 }
 
@@ -456,7 +465,9 @@ function writeReports(manifest: RunManifest, config: TrustedShadowConfig): void 
     `- Latest process start: ${manifest.processStartTime}\n- Event sequence: ${manifest.lastSequence}\n` +
     `- Recovered incomplete event ranges: ${JSON.stringify(manifest.recoveredIncompleteEventRanges)}\n` +
     `- Data directory: \`${resolve(config.runDir)}\`\n- Trusted sources: ${manifest.trustedPnlSources.join(', ')}\n` +
-    `- Guards: ${JSON.stringify(manifest.guards)}\n- Stop reasons: ${manifest.stopReasons.join(', ') || 'none'}\n`, 'utf8');
+    `- Guards: ${JSON.stringify(manifest.guards)}\n` +
+    `- Network preflight: ${JSON.stringify(manifest.networkPreflight ?? null)}\n` +
+    `- Stop reasons: ${manifest.stopReasons.join(', ') || 'none'}\n`, 'utf8');
   writeFileSync(join(config.reportsDir, 'SHADOW_DATA_QUALITY.md'), `# Shadow Data Quality\n\n` + markdownTable([
     ['cycles', s.cycles], ['markets seen', s.marketsSeen],
     ['complete book rate', rate(s.completeBooks, s.booksAttempted)],
@@ -845,6 +856,32 @@ export class TrustedShadowV1Runner {
   async run(signal?: AbortSignal): Promise<RunManifest> {
     const deadline = Date.now() + this.config.durationSeconds * 1000;
     try {
+      const networkPreflight = await runPublicDataPreflight({
+        timeoutMs: this.config.fetchTimeoutMs ?? 15_000,
+        maxAttempts: this.config.preflightAttempts ?? 3,
+        initialBackoffMs: this.config.preflightBackoffMs ?? 500,
+        marketLimit: Math.max(10, this.config.marketLimit),
+      });
+      this.manifest.networkPreflight = networkPreflight;
+      this.writer.append({
+        eventType: 'network_preflight', runId: this.manifest.runId,
+        commitSha: this.manifest.commitSha, processStartTime: this.manifest.processStartTime,
+        ...networkPreflight,
+      });
+      this.syncSequence();
+      if (!networkPreflight.success) {
+        this.manifest.status = 'blocked';
+        this.manifest.stopReasons = [
+          `NETWORK_PREFLIGHT_${networkPreflight.failure ?? 'NETWORK_FAILURE'}`,
+          'MARKET_FEED_UNAVAILABLE',
+        ];
+        this.writer.append({
+          eventType: 'stop_condition', reasons: this.manifest.stopReasons,
+          networkPreflight,
+        });
+        this.syncSequence();
+        return this.manifest;
+      }
       while (Date.now() < deadline && !signal?.aborted) {
         await this.runCycle();
         this.manifest.stats.cycles += 1;
