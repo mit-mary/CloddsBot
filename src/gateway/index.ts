@@ -27,7 +27,7 @@ import { initOrderPersistence } from '../execution/order-persistence';
 import { initDCAPersistence } from '../execution/dca-persistence';
 import { createFeedManager } from '../feeds';
 import { createSessionManager } from '../sessions';
-import { createAgentManager } from '../agents';
+import { createAgentManager, type PaperAgentBoundaryDiagnostics } from '../agents';
 import { createChannelManager } from '../channels';
 import { createPairingService } from '../pairing';
 import { createMemoryService } from '../memory';
@@ -69,6 +69,7 @@ import { createSafetyManager, type SafetyManager } from '../trading/safety';
 import { createCircuitBreaker } from '../execution/circuit-breaker';
 import { createTradingApiRouter } from './api-routes';
 import { createPositionManager, type PositionManager } from '../execution/position-manager';
+import { PAPER_ONLY, assertPaperOnlyEnvironment, isPaperStrategyAllowed } from '../safety/paper-only';
 import { createPositionCloseCallback, createPositionBridge, type PositionBridge } from '../trading/position-bridge';
 import { createBacktestEngine, type BacktestEngine } from '../trading/backtest';
 import { createBotManager, createMeanReversionStrategy, createMomentumStrategy, createArbitrageStrategy, type BotManager } from '../trading/bots';
@@ -417,6 +418,19 @@ export function createGatewayServer(config?: GatewayConfig): GatewayServer {
 export interface AppGateway {
   start(): Promise<void>;
   stop(): Promise<void>;
+  getPaperDiagnostics(): PaperGatewayDiagnostics;
+}
+
+export interface PaperGatewayDiagnostics {
+  executionService: null | 'instantiated';
+  walletLaunchRouterMounted: boolean;
+  cryptoHftInstantiated: boolean;
+  hftDivergenceInstantiated: boolean;
+  marketMakingInstantiated: boolean;
+  copyTradingInstantiated: boolean;
+  opportunityAutoExecutorInstantiated: boolean;
+  registeredStrategyIds: string[];
+  agents: PaperAgentBoundaryDiagnostics;
 }
 
 /**
@@ -430,6 +444,7 @@ export interface AppGateway {
  * - Agent manager for non-command messages
  */
 export async function createGateway(config: Config): Promise<AppGateway> {
+  if (PAPER_ONLY) assertPaperOnlyEnvironment();
   // Railway/Heroku inject PORT — override gateway port if set
   const envPort = parseInt(process.env.PORT ?? '', 10);
   if (envPort > 0 && envPort <= 65535) {
@@ -473,6 +488,7 @@ export async function createGateway(config: Config): Promise<AppGateway> {
       ? createProviderHealthMonitor(providerManager)
       : null;
   let monitoring: MonitoringService | null = null;
+  let walletLaunchRouterMounted = false;
 
   const commands = createCommandRegistry();
   commands.registerMany(createDefaultCommands());
@@ -577,14 +593,15 @@ export async function createGateway(config: Config): Promise<AppGateway> {
     httpGateway.setAuditRouter(createAuditRouter());
   }
 
-  // Wire Launch API router (Solana token launches via Meteora DBC)
-  {
+  // Wallet-backed launch endpoints are intentionally unavailable in this paper-only fork.
+  if (!PAPER_ONLY) {
     const { createLaunchRouter } = await import('./launch-routes.js');
     const { getSolanaConnection, loadSolanaKeypair } = await import('../solana/wallet.js');
     try {
       const launchConnection = getSolanaConnection();
       const launchKeypair = loadSolanaKeypair();
       httpGateway.setLaunchRouter(createLaunchRouter(launchConnection, launchKeypair));
+      walletLaunchRouterMounted = true;
     } catch (err) {
       logger.warn({ err }, 'Launch API: Solana wallet not configured — launch endpoints disabled');
     }
@@ -595,9 +612,9 @@ export async function createGateway(config: Config): Promise<AppGateway> {
   // Create alt-data sentiment pipeline if enabled
   let altDataService: AltDataService | null = null;
 
-  // Create execution service for real trading
+  // Preserve upstream execution code, but never instantiate it in this paper-only fork.
   let executionService: ExecutionService | null = null;
-  if (config.trading?.enabled) {
+  if (config.trading?.enabled && !PAPER_ONLY) {
     const poly = config.trading.polymarket;
     const kalshi = config.trading.kalshi;
     const opinionCfg = config.trading.opinion;
@@ -647,6 +664,8 @@ export async function createGateway(config: Config): Promise<AppGateway> {
     } else {
       logger.warn('Trading enabled but no platform credentials configured');
     }
+  } else if (config.trading?.enabled && PAPER_ONLY) {
+    logger.warn('PAPER_ONLY: live execution service disabled');
   }
 
   // Wire safety + circuit breaker + orchestrator around execution service.
@@ -741,7 +760,7 @@ export async function createGateway(config: Config): Promise<AppGateway> {
 
   // Create copy trading service
   let copyTrading: CopyTradingService | null = null;
-  if (config.copyTrading?.enabled && whaleTracker) {
+  if (isPaperStrategyAllowed('copy-trading') && config.copyTrading?.enabled && whaleTracker) {
     copyTrading = createCopyTradingService(whaleTracker, executionService, {
       followedAddresses: config.copyTrading?.followedAddresses ?? [],
       sizingMode: config.copyTrading?.sizingMode ?? 'fixed',
@@ -750,7 +769,7 @@ export async function createGateway(config: Config): Promise<AppGateway> {
       portfolioPercentage: config.copyTrading?.portfolioPercentage ?? 1,
       maxPositionSize: config.copyTrading?.maxPositionSize ?? 500,
       copyDelayMs: config.copyTrading?.copyDelayMs ?? 5000,
-      dryRun: executionService ? (config.copyTrading?.dryRun ?? false) : true,
+      dryRun: PAPER_ONLY || !executionService || (config.copyTrading?.dryRun ?? false),
     });
   }
 
@@ -922,6 +941,9 @@ export async function createGateway(config: Config): Promise<AppGateway> {
 
   // Bot manager — strategy lifecycle (start/stop/pause/resume)
   let botManager: BotManager | null = null;
+  let cryptoHftInstantiated = false;
+  let hftDivergenceInstantiated = false;
+  let marketMakingInstantiated = false;
 
   // Trade logger — records fills and PnL
   let tradeLogger: TradeLogger | null = null;
@@ -998,8 +1020,8 @@ export async function createGateway(config: Config): Promise<AppGateway> {
   }
 
   // Initialize auto-arbitrage executor if enabled
-  if (config.arbitrageExecution?.enabled && opportunityFinder) {
-    const wantsDryRun = config.arbitrageExecution?.dryRun ?? false;
+  if (isPaperStrategyAllowed('opportunity-executor') && config.arbitrageExecution?.enabled && opportunityFinder) {
+    const wantsDryRun = PAPER_ONLY || (config.arbitrageExecution?.dryRun ?? false);
     const effectiveDryRun = executionService ? wantsDryRun : true;
 
     if (!executionService && !wantsDryRun) {
@@ -2416,18 +2438,19 @@ export async function createGateway(config: Config): Promise<AppGateway> {
   botManager.registerStrategy(createArbitrageStrategy());
 
   // Register MM strategy if configured
-  if (config.trading?.marketMaking?.enabled && executionService) {
+  if (isPaperStrategyAllowed('market-making') && config.trading?.marketMaking?.enabled && executionService) {
     const mmConfig = config.trading.marketMaking as unknown as MMConfig;
     const mmStrategy = createMMStrategy(mmConfig, {
       execution: executionService,
       feeds,
     });
     botManager.registerStrategy(mmStrategy);
+    marketMakingInstantiated = true;
     logger.info('Market making strategy registered');
   }
 
   // Register crypto HFT adapter if configured
-  if (config.trading?.cryptoHft?.enabled) {
+  if (isPaperStrategyAllowed('crypto-hft') && config.trading?.cryptoHft?.enabled) {
     try {
       const { createCryptoFeed } = await import('../feeds/crypto/index.js');
       const { createCryptoHftAdapter } = await import('../trading/adapters/index.js');
@@ -2438,6 +2461,7 @@ export async function createGateway(config: Config): Promise<AppGateway> {
         config: config.trading.cryptoHft,
       });
       botManager.registerStrategy(hftStrategy);
+      cryptoHftInstantiated = true;
       logger.info('Crypto HFT adapter registered');
     } catch (err) {
       logger.warn({ err }, 'Failed to load crypto HFT adapter');
@@ -2445,7 +2469,7 @@ export async function createGateway(config: Config): Promise<AppGateway> {
   }
 
   // Register HFT divergence adapter if configured
-  if (config.trading?.hftDivergence?.enabled) {
+  if (isPaperStrategyAllowed('hft-divergence') && config.trading?.hftDivergence?.enabled) {
     try {
       const { createCryptoFeed } = await import('../feeds/crypto/index.js');
       const { createDivergenceAdapter } = await import('../trading/adapters/index.js');
@@ -2456,6 +2480,7 @@ export async function createGateway(config: Config): Promise<AppGateway> {
         config: config.trading.hftDivergence,
       });
       botManager.registerStrategy(divStrategy);
+      hftDivergenceInstantiated = true;
       logger.info('HFT divergence adapter registered');
     } catch (err) {
       logger.warn({ err }, 'Failed to load HFT divergence adapter');
@@ -2485,6 +2510,19 @@ export async function createGateway(config: Config): Promise<AppGateway> {
   httpGateway.setTradingApiRouter(tradingApiRouter);
 
   return {
+    getPaperDiagnostics(): PaperGatewayDiagnostics {
+      return {
+        executionService: executionService === null ? null : 'instantiated',
+        walletLaunchRouterMounted,
+        cryptoHftInstantiated,
+        hftDivergenceInstantiated,
+        marketMakingInstantiated,
+        copyTradingInstantiated: copyTrading !== null,
+        opportunityAutoExecutorInstantiated: arbitrageExecutor !== null,
+        registeredStrategyIds: botManager?.getStrategies().map(({ id }) => id) ?? [],
+        agents: agents.getPaperBoundaryDiagnostics(),
+      };
+    },
     async start(): Promise<void> {
       logger.info('Starting gateway services');
 

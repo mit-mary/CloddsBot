@@ -451,6 +451,9 @@ export function createSkillManager(workspacePath?: string, config?: SkillManager
     skillsMap.clear();
 
     const loaderOpts = { configKeys: config?.configKeys };
+    const admit = (candidateSkills: Skill[]): Skill[] => config?.allowSkills
+      ? candidateSkills.filter((skill) => config.allowSkills!.includes(skill.name))
+      : candidateSkills;
 
     // 1. Load bundled skills first (lowest priority)
     const bundledDir = path.join(__dirname, 'bundled');
@@ -458,32 +461,34 @@ export function createSkillManager(workspacePath?: string, config?: SkillManager
       allowList: config?.allowBundled,
       ...loaderOpts,
     });
-    for (const skill of bundledSkills) {
+    for (const skill of admit(bundledSkills)) {
       skillsMap.set(skill.name, skill);
     }
 
     // 2. Load from extra directories
-    if (config?.extraDirs) {
+    if (!config?.bundledOnly && config?.extraDirs) {
       for (const dir of config.extraDirs) {
         const extraSkills = loadDirCached(dir, loaderOpts);
-        for (const skill of extraSkills) {
+        for (const skill of admit(extraSkills)) {
           skillsMap.set(skill.name, skill);
         }
       }
     }
 
     // 3. Load managed skills (medium priority)
-    const managedDir = path.join(process.cwd(), '.clodds', 'skills');
-    const managedSkills = loadDirCached(managedDir, loaderOpts);
-    for (const skill of managedSkills) {
-      skillsMap.set(skill.name, skill);
+    if (!config?.bundledOnly) {
+      const managedDir = path.join(process.cwd(), '.clodds', 'skills');
+      const managedSkills = loadDirCached(managedDir, loaderOpts);
+      for (const skill of admit(managedSkills)) {
+        skillsMap.set(skill.name, skill);
+      }
     }
 
     // 4. Load workspace skills (highest priority)
-    if (workspacePath) {
+    if (!config?.bundledOnly && workspacePath) {
       const workspaceSkillsDir = path.join(workspacePath, 'skills');
       const workspaceSkills = loadDirCached(workspaceSkillsDir, loaderOpts);
-      for (const skill of workspaceSkills) {
+      for (const skill of admit(workspaceSkills)) {
         skillsMap.set(skill.name, skill);
       }
     }
@@ -521,10 +526,10 @@ export function createSkillManager(workspacePath?: string, config?: SkillManager
     const debounceMs = config?.watchDebounceMs ?? 500;
     const dirs = [
       path.join(__dirname, 'bundled'),
-      path.join(process.cwd(), '.clodds', 'skills'),
-      ...(config?.extraDirs || []),
+      ...(!config?.bundledOnly ? [path.join(process.cwd(), '.clodds', 'skills')] : []),
+      ...(!config?.bundledOnly ? (config?.extraDirs || []) : []),
     ];
-    if (workspacePath) {
+    if (!config?.bundledOnly && workspacePath) {
       dirs.push(path.join(workspacePath, 'skills'));
     }
 

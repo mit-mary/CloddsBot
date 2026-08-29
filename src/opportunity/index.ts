@@ -57,6 +57,13 @@ import { createOpportunityAnalytics, OpportunityAnalytics } from './analytics';
 import { createMarketLinker, MarketLinker, MarketLink } from './links';
 import { createRiskModeler, RiskModeler, RiskModelOutput, ArbitrageLeg } from './risk';
 import { getPlatformFeeRate } from './combinatorial';
+import {
+  FEE_UNKNOWN,
+  quotePolymarketFee,
+  simulateBookFill,
+  type BookFill,
+  type FeeQuote,
+} from '../execution/prediction-market-economics';
 
 // =============================================================================
 // TYPES
@@ -481,6 +488,36 @@ export function createOpportunityFinder(
   // INTERNAL ARBITRAGE (YES + NO < $1)
   // ==========================================================================
 
+  async function executeOpportunityLeg(
+    platform: Platform,
+    market: Market,
+    outcome: Outcome,
+    side: 'buy' | 'sell',
+    shares: number,
+  ): Promise<{ fill: BookFill; fee: FeeQuote } | null> {
+    const bookId = outcome.tokenId ?? outcome.id ?? market.id;
+    const orderbook = await feeds.getOrderbook(platform, bookId).catch(() => null);
+    if (!orderbook) return null;
+    const fill = simulateBookFill({ book: orderbook, side, shares });
+    if (fill.status === 'none' || fill.vwap === null) return null;
+
+    const fee = platform === 'polymarket'
+      ? quotePolymarketFee({
+          shares: fill.filledSize,
+          price: fill.vwap,
+          liquidityRole: 'taker',
+          feesEnabled: market.feesEnabled,
+          feeSchedule: market.feeSchedule,
+        })
+      : {
+          status: 'KNOWN' as const,
+          fee: fill.spentOrReceived * getPlatformFeeRate(platform),
+          rate: getPlatformFeeRate(platform),
+          formula: 'notional * configured platform rate',
+        };
+    return { fill, fee };
+  }
+
   async function findInternalArbitrage(
     marketsByPlatform: Map<Platform, Market[]>,
     minEdge: number,
@@ -498,31 +535,48 @@ export function createOpportunityFinder(
 
         if (!yesOutcome || !noOutcome) continue;
 
-        const yesPrice = yesOutcome.price;
-        const noPrice = noOutcome.price;
-
-        if (!isValidPrice(yesPrice) || !isValidPrice(noPrice)) continue;
-
-        const sum = yesPrice + noPrice;
-        const grossEdgePct = (1 - sum) * 100;
-
-        // Calculate fee-adjusted edge (taker fees on both YES and NO)
-        // Note: Polymarket has 0% fees on most markets, so this preserves the edge
-        const feeRate = getPlatformFeeRate(platform);
-        const totalFees = sum * feeRate; // Fees on total cost
-        const netEdgePct = grossEdgePct - (totalFees * 100);
-        const edgePct = netEdgePct;
-
-        if (edgePct < minEdge) continue;
-
         const liquidity = Math.min(
           yesOutcome.volume24h || minLiquidity,
           noOutcome.volume24h || minLiquidity
         );
-
         if (liquidity < minLiquidity) continue;
+        const requestedSize = Math.min(100, liquidity * 0.1);
+        if (requestedSize <= 0) continue;
 
-        const profitPer100 = (edgePct / 100) * 100;
+        const initialLegs = await Promise.all([
+          executeOpportunityLeg(platform, market, yesOutcome, 'buy', requestedSize),
+          executeOpportunityLeg(platform, market, noOutcome, 'buy', requestedSize),
+        ]);
+        if (!initialLegs[0] || !initialLegs[1]) continue;
+        if (initialLegs.some((leg) => leg!.fee.status === FEE_UNKNOWN)) {
+          logger.debug({ platform, marketId: market.id }, 'Internal opportunity blocked by FEE_UNKNOWN');
+          continue;
+        }
+
+        const matchedSize = Math.min(...initialLegs.map((leg) => leg!.fill.filledSize));
+        if (matchedSize <= 0) continue;
+        // Reprice both legs to exactly the matched quantity: unmatched inventory is not arbitrage P&L.
+        const legs = matchedSize === requestedSize
+          ? initialLegs
+          : await Promise.all([
+              executeOpportunityLeg(platform, market, yesOutcome, 'buy', matchedSize),
+              executeOpportunityLeg(platform, market, noOutcome, 'buy', matchedSize),
+            ]);
+        if (!legs[0] || !legs[1] || legs.some((leg) => !leg!.fill.complete || leg!.fee.status === FEE_UNKNOWN)) continue;
+
+        const yesPrice = legs[0].fill.vwap!;
+        const noPrice = legs[1].fill.vwap!;
+        const totalCost = legs[0].fill.spentOrReceived + legs[1].fill.spentOrReceived;
+        const totalFees = (legs[0].fee.fee ?? 0) + (legs[1].fee.fee ?? 0);
+        const netProfit = matchedSize - totalCost - totalFees;
+        const edgePct = totalCost > 0 ? netProfit / totalCost * 100 : 0;
+        if (edgePct < minEdge) continue;
+        const profitPer100 = edgePct;
+        const execution = createExecutionPlan('internal', platform, market, yesPrice, noPrice);
+        execution.steps.forEach((step) => { step.size = matchedSize; });
+        execution.totalCost = totalCost + totalFees;
+        execution.estimatedProfit = netProfit;
+        if (matchedSize < requestedSize) execution.warnings.push(`Capacity limited to ${matchedSize} matched shares`);
 
         const opp: Opportunity = {
           id: `internal_${platform}_${market.id}_${Date.now()}`,
@@ -535,10 +589,10 @@ export function createOpportunityFinder(
               outcome: yesOutcome.name || 'YES',
               normalizedOutcome: 'YES',
               price: yesPrice,
-              liquidity: yesOutcome.volume24h || 0,
+              liquidity: legs[0].fill.availableCapacity,
               volume24h: yesOutcome.volume24h || 0,
               action: 'buy',
-              recommendedSize: Math.min(100, liquidity * 0.1),
+              recommendedSize: matchedSize,
             },
             {
               platform,
@@ -547,10 +601,10 @@ export function createOpportunityFinder(
               outcome: noOutcome.name || 'NO',
               normalizedOutcome: 'NO',
               price: noPrice,
-              liquidity: noOutcome.volume24h || 0,
+              liquidity: legs[1].fill.availableCapacity,
               volume24h: noOutcome.volume24h || 0,
               action: 'buy',
-              recommendedSize: Math.min(100, liquidity * 0.1),
+              recommendedSize: matchedSize,
             },
           ],
           edgePct,
@@ -558,9 +612,9 @@ export function createOpportunityFinder(
           score: 0, // Will be scored later
           confidence: 0.9, // High confidence for internal arb
           kellyFraction: 0,
-          estimatedSlippage: 0,
-          totalLiquidity: liquidity,
-          execution: createExecutionPlan('internal', platform, market, yesPrice, noPrice),
+          estimatedSlippage: ((legs[0].fill.slippage ?? 0) + (legs[1].fill.slippage ?? 0)) * 100,
+          totalLiquidity: matchedSize,
+          execution,
           discoveredAt: new Date(),
           expiresAt: new Date(Date.now() + cfg.opportunityTtlMs),
           status: 'active',
@@ -620,6 +674,8 @@ export function createOpportunityFinder(
       const pricesByPlatform: Array<{
         platform: Platform;
         market: Market;
+        yesOutcome: Outcome;
+        noOutcome?: Outcome;
         yesPrice: number;
         noPrice: number;
         liquidity: number;
@@ -641,6 +697,8 @@ export function createOpportunityFinder(
         pricesByPlatform.push({
           platform,
           market,
+          yesOutcome,
+          noOutcome,
           yesPrice: yesOutcome.price,
           noPrice: noOutcome?.price ?? (1 - yesOutcome.price),
           liquidity: Math.min(yesOutcome.volume24h || 0, noOutcome?.volume24h || 0),
@@ -655,33 +713,75 @@ export function createOpportunityFinder(
       const lowest = pricesByPlatform[0];
       const highest = pricesByPlatform[pricesByPlatform.length - 1];
 
-      // Strategy 1: Buy YES on low, Sell YES on high (if platforms support selling)
-      const grossSpreadYes = (highest.yesPrice - lowest.yesPrice) * 100;
-
-      // Strategy 2: Buy YES on low, Buy NO on high (if NO + YES_low < $1)
-      const combinedCost = lowest.yesPrice + highest.noPrice;
-      const grossCrossEdge = (1 - combinedCost) * 100;
-
-      // Calculate fee-adjusted edges (fees proportional to cost on each platform)
-      const lowestFeeRate = getPlatformFeeRate(lowest.platform);
-      const highestFeeRate = getPlatformFeeRate(highest.platform);
-
-      // Spread strategy fees: buy YES on low platform, sell YES on high platform
-      const spreadFeesPct = (lowest.yesPrice * lowestFeeRate + highest.yesPrice * highestFeeRate) * 100;
-      const spreadYes = grossSpreadYes - spreadFeesPct;
-
-      // Cross strategy fees: buy YES on low platform, buy NO on high platform
-      const crossFeesPct = (lowest.yesPrice * lowestFeeRate + highest.noPrice * highestFeeRate) * 100;
-      const crossEdge = grossCrossEdge - crossFeesPct;
-
-      const edgePct = Math.max(spreadYes, crossEdge);
-
-      if (edgePct < minEdge) continue;
-
       const liquidity = Math.min(lowest.liquidity, highest.liquidity);
       if (liquidity < minLiquidity) continue;
+      const requestedSize = Math.min(100, liquidity * 0.1);
+      if (requestedSize <= 0) continue;
 
-      const profitPer100 = (edgePct / 100) * 100;
+      async function evaluateExecutablePair(
+        secondOutcome: Outcome | undefined,
+        secondSide: 'buy' | 'sell',
+        settlementPerPair: number,
+      ) {
+        if (!secondOutcome) return null;
+        let pair = await Promise.all([
+          executeOpportunityLeg(lowest.platform, lowest.market, lowest.yesOutcome, 'buy', requestedSize),
+          executeOpportunityLeg(highest.platform, highest.market, secondOutcome, secondSide, requestedSize),
+        ]);
+        if (!pair[0] || !pair[1] || pair.some((leg) => leg!.fee.status === FEE_UNKNOWN)) return null;
+        const matchedSize = Math.min(pair[0].fill.filledSize, pair[1].fill.filledSize);
+        if (matchedSize <= 0) return null;
+        if (matchedSize < requestedSize) {
+          pair = await Promise.all([
+            executeOpportunityLeg(lowest.platform, lowest.market, lowest.yesOutcome, 'buy', matchedSize),
+            executeOpportunityLeg(highest.platform, highest.market, secondOutcome, secondSide, matchedSize),
+          ]);
+        }
+        if (!pair[0] || !pair[1] || pair.some((leg) => !leg!.fill.complete || leg!.fee.status === FEE_UNKNOWN)) return null;
+        const buys = pair
+          .filter((_, index) => index === 0 || secondSide === 'buy')
+          .reduce((sum, leg) => sum + leg!.fill.spentOrReceived, 0);
+        const sells = secondSide === 'sell' ? pair[1].fill.spentOrReceived : 0;
+        const fees = pair.reduce((sum, leg) => sum + (leg!.fee.fee ?? 0), 0);
+        const pnl = matchedSize * settlementPerPair + sells - buys - fees;
+        const capitalAtRisk = buys + fees;
+        return {
+          pair: pair as [NonNullable<(typeof pair)[0]>, NonNullable<(typeof pair)[1]>],
+          matchedSize,
+          pnl,
+          edgePct: capitalAtRisk > 0 ? pnl / capitalAtRisk * 100 : 0,
+          fees,
+        };
+      }
+
+      const [spreadStrategy, completeSetStrategy] = await Promise.all([
+        evaluateExecutablePair(highest.yesOutcome, 'sell', 0),
+        evaluateExecutablePair(highest.noOutcome, 'buy', 1),
+      ]);
+      const candidates = [
+        spreadStrategy && { ...spreadStrategy, buyNo: false },
+        completeSetStrategy && { ...completeSetStrategy, buyNo: true },
+      ].filter((candidate): candidate is NonNullable<typeof candidate> => candidate !== null);
+      if (candidates.length === 0) continue;
+      candidates.sort((a, b) => b.edgePct - a.edgePct);
+      const selected = candidates[0];
+      if (selected.edgePct < minEdge) continue;
+
+      const edgePct = selected.edgePct;
+      const profitPer100 = edgePct;
+      const buyNo = selected.buyNo;
+      const lowPrice = selected.pair[0].fill.vwap!;
+      const highPrice = selected.pair[1].fill.vwap!;
+      const execution = createCrossExecutionPlan(
+        { ...lowest, yesPrice: lowPrice },
+        buyNo ? { ...highest, noPrice: highPrice } : { ...highest, yesPrice: highPrice },
+        buyNo,
+      );
+      execution.steps.forEach((step) => { step.size = selected.matchedSize; });
+      execution.estimatedProfit = selected.pnl;
+      if (selected.matchedSize < requestedSize) {
+        execution.warnings.push(`Capacity limited to ${selected.matchedSize} matched shares`);
+      }
 
       const opp: Opportunity = {
         id: `cross_${lowest.platform}_${highest.platform}_${match.canonicalId}_${Date.now()}`,
@@ -693,23 +793,23 @@ export function createOpportunityFinder(
             question: lowest.market.question,
             outcome: 'YES',
             normalizedOutcome: 'YES',
-            price: lowest.yesPrice,
-            liquidity: lowest.liquidity,
+            price: lowPrice,
+            liquidity: selected.pair[0].fill.availableCapacity,
             volume24h: lowest.market.volume24h || 0,
             action: 'buy',
-            recommendedSize: Math.min(100, liquidity * 0.1),
+            recommendedSize: selected.matchedSize,
           },
           {
             platform: highest.platform,
             marketId: highest.market.id,
             question: highest.market.question,
-            outcome: crossEdge > spreadYes ? 'NO' : 'YES',
-            normalizedOutcome: crossEdge > spreadYes ? 'NO' : 'YES',
-            price: crossEdge > spreadYes ? highest.noPrice : highest.yesPrice,
-            liquidity: highest.liquidity,
+            outcome: buyNo ? 'NO' : 'YES',
+            normalizedOutcome: buyNo ? 'NO' : 'YES',
+            price: highPrice,
+            liquidity: selected.pair[1].fill.availableCapacity,
             volume24h: highest.market.volume24h || 0,
-            action: crossEdge > spreadYes ? 'buy' : 'sell',
-            recommendedSize: Math.min(100, liquidity * 0.1),
+            action: buyNo ? 'buy' : 'sell',
+            recommendedSize: selected.matchedSize,
           },
         ],
         edgePct,
@@ -717,9 +817,9 @@ export function createOpportunityFinder(
         score: 0,
         confidence: match.similarity,
         kellyFraction: 0,
-        estimatedSlippage: 0,
-        totalLiquidity: liquidity,
-        execution: createCrossExecutionPlan(lowest, highest, crossEdge > spreadYes),
+        estimatedSlippage: ((selected.pair[0].fill.slippage ?? 0) + (selected.pair[1].fill.slippage ?? 0)) * 100,
+        totalLiquidity: selected.matchedSize,
+        execution,
         discoveredAt: new Date(),
         expiresAt: new Date(Date.now() + cfg.opportunityTtlMs),
         status: 'active',
@@ -1044,37 +1144,11 @@ export function createOpportunityFinder(
       );
 
       if (affected) {
-        // Update price and recalculate edge based on new prices
-        affected.price = update.price;
-
-        // Recalculate edgePct based on opportunity type
-        if (opp.type === 'internal' && opp.markets.length === 2) {
-          const sum = opp.markets[0].price + opp.markets[1].price;
-          const feeRate = getPlatformFeeRate(opp.markets[0].platform);
-          const totalFees = sum * feeRate;
-          opp.edgePct = (1 - sum) * 100 - totalFees * 100;
-          opp.profitPer100 = (opp.edgePct / 100) * 100;
-        } else if (opp.type === 'cross_platform' && opp.markets.length === 2) {
-          const m0 = opp.markets[0];
-          const m1 = opp.markets[1];
-          const combinedCost = m0.price + m1.price;
-          const fee0 = m0.price * getPlatformFeeRate(m0.platform);
-          const fee1 = m1.price * getPlatformFeeRate(m1.platform);
-          opp.edgePct = (1 - combinedCost) * 100 - (fee0 + fee1) * 100;
-          opp.profitPer100 = (opp.edgePct / 100) * 100;
-        }
-
-        const rescored = scorer.score(opp);
-        Object.assign(opp, rescored);
-
-        // Check if still valid
-        if (opp.edgePct < cfg.minEdge) {
-          opp.status = 'expired';
-          toExpire.push(id);
-          emitter.emit('expired', opp);
-        } else {
-          emitter.emit('updated', opp);
-        }
+        // Scalar updates cannot safely reprice a depth/fee-aware opportunity.
+        // Expire it; the next scan consumes fresh books and fee metadata.
+        opp.status = 'expired';
+        toExpire.push(id);
+        emitter.emit('expired', opp);
       }
     }
     // Delete expired entries outside the iteration loop

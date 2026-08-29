@@ -48,6 +48,23 @@ export interface RiskModelInput {
   timeHorizonMs?: number;
   /** Are outcomes on the same underlying event? */
   sameEvent: boolean;
+  /** Optional observed paper/replay fills; estimates never overwrite these facts. */
+  actualExecutions?: ActualLegExecution[];
+}
+
+export interface ActualLegExecution {
+  legIndex: number;
+  requestedSize: number;
+  filledSize: number;
+  executedAtMs: number;
+}
+
+export interface ExecutionReality {
+  matchedQuantity: number;
+  legFillQuantities: number[];
+  legImbalance: number;
+  unhedgedSize: number;
+  secondLegDelayMs: number | null;
 }
 
 export interface RiskModelOutput {
@@ -75,6 +92,8 @@ export interface RiskModelOutput {
   adjustedPositionSize: number;
   /** Execution sequence recommendation */
   executionSequence: number[];
+  /** Present only when observed replay/shadow executions were supplied. */
+  executionReality?: ExecutionReality;
 }
 
 export interface RiskBreakdown {
@@ -158,6 +177,32 @@ const PLATFORM_RISK_SCORES: Record<Platform, number> = {
   mexc: 30,         // Mid-tier CEX
   percolator: 45,   // Solana on-chain perps, devnet — newer protocol
 };
+
+export function summarizeExecutionReality(executions: ActualLegExecution[]): ExecutionReality {
+  if (executions.length === 0) {
+    return {
+      matchedQuantity: 0,
+      legFillQuantities: [],
+      legImbalance: 0,
+      unhedgedSize: 0,
+      secondLegDelayMs: null,
+    };
+  }
+  const ordered = [...executions].sort((a, b) => a.legIndex - b.legIndex);
+  const quantities = ordered.map((execution) => Math.max(0, execution.filledSize));
+  const matchedQuantity = Math.min(...quantities);
+  const largest = Math.max(...quantities);
+  const smallest = Math.min(...quantities);
+  return {
+    matchedQuantity,
+    legFillQuantities: quantities,
+    legImbalance: largest - smallest,
+    unhedgedSize: largest - matchedQuantity,
+    secondLegDelayMs: ordered.length >= 2
+      ? Math.max(0, ordered[1].executedAtMs - ordered[0].executedAtMs)
+      : null,
+  };
+}
 
 // =============================================================================
 // IMPLEMENTATION
@@ -274,6 +319,9 @@ export function createRiskModeler(): RiskModeler {
    */
   function modelRisk(input: RiskModelInput): RiskModelOutput {
     const { legs, positionSize, expectedEdge, timeHorizonMs = 86400000, sameEvent } = input;
+    const executionReality = input.actualExecutions
+      ? summarizeExecutionReality(input.actualExecutions)
+      : undefined;
 
     if (legs.length === 0) {
       return {
@@ -287,6 +335,7 @@ export function createRiskModeler(): RiskModeler {
           correlationRisk: { score: 0, correlation: 0, diversificationBenefit: 0 },
         },
         recommendations: ['No legs provided'], adjustedPositionSize: 0, executionSequence: [],
+        executionReality,
       };
     }
 
@@ -479,6 +528,7 @@ export function createRiskModeler(): RiskModeler {
       recommendations,
       adjustedPositionSize,
       executionSequence: optimizeSequence(legs),
+      executionReality,
     };
   }
 

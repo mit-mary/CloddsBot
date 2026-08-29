@@ -18,7 +18,8 @@ const GAMMA_URL = 'https://gamma-api.polymarket.com';
 export interface PolymarketFeed extends EventEmitter {
   start: () => Promise<void>;
   stop: () => Promise<void>;
-  getMarket: (platform: string, marketId: string) => Promise<Market | null>;
+  /** Accepts either getMarket(marketId) or the legacy getMarket(platform, marketId). */
+  getMarket: (platformOrMarketId: string, marketId?: string) => Promise<Market | null>;
   searchMarkets: (query: string) => Promise<Market[]>;
   getPrice: (platform: string, marketId: string) => Promise<number | null>;
   getOrderbook: (platform: string, marketId: string) => Promise<Orderbook | null>;
@@ -45,6 +46,15 @@ interface PolymarketMarket {
   volume: string;
   liquidity: string;
   slug: string;
+  feesEnabled?: boolean;
+  fees_enabled?: boolean;
+  feeSchedule?: {
+    rate?: number | string;
+    exponent?: number | string;
+    takerOnly?: boolean;
+    rebateRate?: number | string;
+  } | string | null;
+  fee_schedule?: PolymarketMarket['feeSchedule'];
 }
 
 interface PolymarketOrderbookResponse {
@@ -462,6 +472,21 @@ export async function createPolymarketFeed(): Promise<PolymarketFeed> {
   }
 
   function convertMarket(data: PolymarketMarket): Market {
+    const rawSchedule = data.feeSchedule ?? data.fee_schedule;
+    let parsedSchedule: Exclude<Market['feeSchedule'], null | undefined> | null = null;
+    try {
+      const schedule = typeof rawSchedule === 'string' ? JSON.parse(rawSchedule) : rawSchedule;
+      if (schedule && schedule.rate !== undefined && Number.isFinite(Number(schedule.rate))) {
+        parsedSchedule = {
+          rate: Number(schedule.rate),
+          exponent: schedule.exponent === undefined ? 1 : Number(schedule.exponent),
+          takerOnly: schedule.takerOnly,
+          rebateRate: schedule.rebateRate === undefined ? undefined : Number(schedule.rebateRate),
+        };
+      }
+    } catch {
+      parsedSchedule = null;
+    }
     return {
       id: data.condition_id,
       platform: 'polymarket' as Platform,
@@ -483,6 +508,8 @@ export async function createPolymarketFeed(): Promise<PolymarketFeed> {
       url: `https://polymarket.com/event/${data.slug}`,
       createdAt: new Date(),
       updatedAt: new Date(),
+      feesEnabled: data.feesEnabled ?? data.fees_enabled,
+      feeSchedule: parsedSchedule,
     };
   }
 
@@ -501,7 +528,8 @@ export async function createPolymarketFeed(): Promise<PolymarketFeed> {
     }
   };
 
-  emitter.getMarket = async (_platform: string, marketId: string) => {
+  emitter.getMarket = async (platformOrMarketId: string, legacyMarketId?: string) => {
+    const marketId = legacyMarketId ?? platformOrMarketId;
     // Check cache first (with TTL)
     const cached = getFromMarketCache(marketId);
     if (cached) return cached;
@@ -519,7 +547,7 @@ export async function createPolymarketFeed(): Promise<PolymarketFeed> {
   };
 
   emitter.getPrice = async (_platform: string, marketId: string) => {
-    const market = await emitter.getMarket('polymarket', marketId);
+    const market = await emitter.getMarket(marketId);
     if (market && market.outcomes.length > 0) {
       return market.outcomes[0].price;
     }

@@ -126,6 +126,7 @@ describe('backtest engine', () => {
       evalIntervalMs: 0,
       priceHistorySize: 200,
       includeOrderbook: false,
+      executionMode: 'legacy-tick-price-non-realistic',
     }, []);
 
     assert.equal(result.strategyId, 'test');
@@ -133,6 +134,8 @@ describe('backtest engine', () => {
     assert.equal(result.metrics.finalEquity, 10000);
     assert.equal(result.trades.length, 0);
     assert.equal(result.equityCurve.length, 0);
+    assert.equal(result.pnlNamespace, 'legacy-research');
+    assert.equal(result.pnlSource, 'legacy-tick-price-non-realistic');
   });
 
   it('executes buy-and-hold strategy on tick data', async () => {
@@ -180,6 +183,7 @@ describe('backtest engine', () => {
       evalIntervalMs: 0,
       priceHistorySize: 200,
       includeOrderbook: false,
+      executionMode: 'legacy-tick-price-non-realistic',
     }, ticks);
 
     assert.equal(result.strategyId, 'buy-hold');
@@ -256,6 +260,7 @@ describe('backtest engine', () => {
       evalIntervalMs: 0,
       priceHistorySize: 200,
       includeOrderbook: false,
+      executionMode: 'legacy-tick-price-non-realistic',
     }, ticks);
 
     // Should have 1 buy + 1 sell
@@ -299,6 +304,7 @@ describe('backtest engine', () => {
       evalIntervalMs: 3000, // Evaluate every 3 seconds
       priceHistorySize: 200,
       includeOrderbook: false,
+      executionMode: 'legacy-tick-price-non-realistic',
     }, ticks);
 
     // 10 seconds of data, eval every 3s → should eval ~3-4 times (at 0, 3, 6, 9s)
@@ -344,6 +350,7 @@ describe('backtest engine', () => {
       evalIntervalMs: 0,
       priceHistorySize: 200,
       includeOrderbook: false,
+      executionMode: 'legacy-tick-price-non-realistic',
     }, ticks);
 
     assert.equal(result.trades.length, 1);
@@ -397,6 +404,139 @@ describe('backtest engine', () => {
     assert.ok(receivedOrderbook, 'Strategy should receive orderbook data');
   });
 
+  it('consumes orderbook depth for tick-replay fills', async () => {
+    const engine = createBacktestEngine(createMockDb());
+    let signaled = false;
+    const strategy = {
+      config: { id: 'depth-fill', name: 'Depth Fill', platforms: ['polymarket'] },
+      async evaluate() {
+        if (signaled) return [];
+        signaled = true;
+        return [{ type: 'buy' as const, platform: 'polymarket', marketId: 'test-market', outcome: 'yes', size: 100 }];
+      },
+    };
+    const snapshot = makeOrderbookSnapshot(0, 0.41);
+    snapshot.asks = [[0.42, 2], [0.43, 10], [0.47, 100]];
+    const result = await engine.runWithTicks(strategy, {
+      platform: 'polymarket', marketId: 'test-market', outcomeId: 'yes',
+      startDate: new Date('2025-01-01'), endDate: new Date('2025-01-02'),
+      initialCapital: 10000, commissionPct: 0, slippagePct: 0,
+      resolutionMs: 0, riskFreeRate: 5, evalIntervalMs: 0,
+      priceHistorySize: 200, includeOrderbook: true,
+      polymarketFees: { feesEnabled: false },
+    }, [makeTick(0.41, 0)], [snapshot]);
+    assert.equal(result.trades.length, 1);
+    assert.ok(Math.abs(result.trades[0].price - 0.465) < 1e-12);
+    assert.equal(result.trades[0].size, 100);
+    assert.equal(result.trades[0].fillStatus, 'full');
+  });
+
+  it('records partial depth fills at the actually matched size', async () => {
+    const engine = createBacktestEngine(createMockDb());
+    let signaled = false;
+    const strategy = {
+      config: { id: 'partial-fill', name: 'Partial Fill', platforms: ['polymarket'] },
+      async evaluate() {
+        if (signaled) return [];
+        signaled = true;
+        return [{ type: 'buy' as const, platform: 'polymarket', marketId: 'test-market', outcome: 'yes', size: 10 }];
+      },
+    };
+    const snapshot = makeOrderbookSnapshot(0, 0.41);
+    snapshot.asks = [[0.42, 2], [0.43, 3]];
+    const result = await engine.runWithTicks(strategy, {
+      platform: 'polymarket', marketId: 'test-market', outcomeId: 'yes',
+      startDate: new Date('2025-01-01'), endDate: new Date('2025-01-02'),
+      initialCapital: 10000, commissionPct: 0, slippagePct: 0,
+      resolutionMs: 0, riskFreeRate: 5, evalIntervalMs: 0,
+      priceHistorySize: 200, includeOrderbook: true,
+      polymarketFees: { feesEnabled: false },
+    }, [makeTick(0.41, 0)], [snapshot]);
+    assert.equal(result.trades[0].size, 5);
+    assert.equal(result.trades[0].fillStatus, 'partial');
+    assert.equal(result.trades[0].unfilledSize, 5);
+  });
+
+  it('blocks tick-replay execution when Polymarket fees are unknown', async () => {
+    const engine = createBacktestEngine(createMockDb());
+    const strategy = {
+      config: { id: 'fee-unknown', name: 'Fee Unknown', platforms: ['polymarket'] },
+      async evaluate() {
+        return [{ type: 'buy' as const, platform: 'polymarket', marketId: 'test-market', outcome: 'yes', size: 1 }];
+      },
+    };
+    const result = await engine.runWithTicks(strategy, {
+      platform: 'polymarket', marketId: 'test-market', outcomeId: 'yes',
+      startDate: new Date('2025-01-01'), endDate: new Date('2025-01-02'),
+      initialCapital: 10000, commissionPct: 0, slippagePct: 0,
+      resolutionMs: 0, riskFreeRate: 5, evalIntervalMs: 0,
+      priceHistorySize: 200, includeOrderbook: true,
+    }, [makeTick(0.41, 0)], [makeOrderbookSnapshot(0, 0.41)]);
+    assert.equal(result.trades.length, 0);
+    assert.equal(result.rejections?.[0].reason, 'FEE_UNKNOWN');
+  });
+
+  it('defaults to NO ORDERBOOK -> NO_FILL instead of using tick price', async () => {
+    const engine = createBacktestEngine(createMockDb());
+    const strategy = {
+      config: { id: 'strict-no-book', name: 'Strict No Book', platforms: ['polymarket'] },
+      async evaluate() {
+        return [{ type: 'buy' as const, platform: 'polymarket', marketId: 'test-market', outcome: 'yes', size: 2 }];
+      },
+    };
+    const result = await engine.runWithTicks(strategy, {
+      platform: 'polymarket', marketId: 'test-market', outcomeId: 'yes',
+      startDate: new Date('2025-01-01'), endDate: new Date('2025-01-02'),
+      initialCapital: 10000, commissionPct: 0, slippagePct: 0,
+      resolutionMs: 0, riskFreeRate: 5, evalIntervalMs: 0,
+      priceHistorySize: 200, includeOrderbook: true,
+    }, [makeTick(0.41, 0)]);
+    assert.equal(result.trades.length, 0);
+    assert.deepEqual(result.rejections?.[0], {
+      timestamp: new Date('2025-01-01T00:00:00.000Z'),
+      side: 'buy',
+      requestedSize: 2,
+      reason: 'NO_ORDERBOOK_NO_FILL',
+      status: 'no-fill',
+      filledSize: 0,
+      fillPrice: null,
+      vwap: null,
+      bookStatus: 'missing',
+    });
+    assert.equal(result.pnlNamespace, 'trusted-shadow');
+    assert.equal(result.pnlSource, 'trusted-orderbook-tick-execution');
+  });
+
+  it('treats a stale orderbook as NO_FILL in trusted mode', async () => {
+    const engine = createBacktestEngine(createMockDb());
+    const strategy = {
+      config: { id: 'strict-stale-book', name: 'Strict Stale Book', platforms: ['polymarket'] },
+      async evaluate() {
+        return [{ type: 'buy' as const, platform: 'polymarket', marketId: 'test-market', outcome: 'yes', size: 2 }];
+      },
+    };
+    const stale = makeOrderbookSnapshot(0, 0.41);
+    const result = await engine.runWithTicks(strategy, {
+      platform: 'polymarket', marketId: 'test-market', outcomeId: 'yes',
+      startDate: new Date('2025-01-01'), endDate: new Date('2025-01-02'),
+      initialCapital: 10000, commissionPct: 0, slippagePct: 0,
+      resolutionMs: 0, riskFreeRate: 5, evalIntervalMs: 0,
+      priceHistorySize: 200, includeOrderbook: true,
+    }, [makeTick(0.41, 61_000)], [stale]);
+    assert.equal(result.trades.length, 0);
+    assert.deepEqual(result.rejections?.[0], {
+      timestamp: new Date('2025-01-01T00:01:01.000Z'),
+      side: 'buy',
+      requestedSize: 2,
+      reason: 'NO_ORDERBOOK_NO_FILL',
+      status: 'no-fill',
+      filledSize: 0,
+      fillPrice: null,
+      vwap: null,
+      bookStatus: 'stale',
+    });
+  });
+
   it('calls strategy init and cleanup', async () => {
     const db = createMockDb();
     const engine = createBacktestEngine(db);
@@ -426,6 +566,7 @@ describe('backtest engine', () => {
       evalIntervalMs: 0,
       priceHistorySize: 200,
       includeOrderbook: false,
+      executionMode: 'legacy-tick-price-non-realistic',
     }, ticks);
 
     assert.ok(initCalled, 'init should be called');
@@ -595,6 +736,8 @@ describe('backtest metrics', () => {
     }, data);
 
     assert.equal(result.strategyId, 'rising');
+    assert.equal(result.pnlNamespace, 'legacy-research');
+    assert.equal(result.pnlSource, 'bar-backtest');
     assert.ok(result.metrics.totalTrades >= 2, 'Should have at least buy+sell');
     assert.ok(result.equityCurve.length > 0, 'Should have equity curve');
   });

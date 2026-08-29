@@ -19,6 +19,12 @@ import { logger } from '../utils/logger';
 import type { Platform, Orderbook } from '../types';
 import type { FeedManager } from '../feeds/index';
 import { getMarketFeatures, getLiquidityScore, getSpreadPct } from '../services/feature-engineering';
+import {
+  FEE_UNKNOWN,
+  quotePolymarketFee,
+  simulateBookFill,
+  type FeeStatus,
+} from './prediction-market-economics';
 
 // =============================================================================
 // TYPES
@@ -50,18 +56,32 @@ export interface SmartRouterConfig {
 export interface RouteQuote {
   platform: Platform;
   price: number;
+  requestedSize: number;
   availableSize: number;
-  estimatedFees: number;
-  netPrice: number; // price + fees
+  estimatedFees: number | null;
+  netPrice: number | null; // price +/- fees per share
+  feeStatus: FeeStatus;
+  fillStatus: 'full' | 'partial' | 'none';
+  executable: boolean;
+  blockReason?: string;
   slippage: number;
   executionTimeMs?: number;
   isMaker: boolean;
 }
 
+export interface ExecutableRouteQuote extends RouteQuote {
+  estimatedFees: number;
+  netPrice: number;
+  feeStatus: 'KNOWN';
+  executable: true;
+}
+
 export interface RoutingResult {
-  bestRoute: RouteQuote;
-  allRoutes: RouteQuote[];
-  splitRoutes?: RouteQuote[];
+  bestRoute: ExecutableRouteQuote;
+  allRoutes: ExecutableRouteQuote[];
+  /** Diagnostic quotes that were blocked by depth, maker uncertainty, or FEE_UNKNOWN. */
+  blockedRoutes?: RouteQuote[];
+  splitRoutes?: ExecutableRouteQuote[];
   totalSavings: number;
   recommendation: string;
 }
@@ -73,7 +93,7 @@ export interface OrderRouteParams {
   alternativeIds?: Record<Platform, string>;
   /** Order side */
   side: 'buy' | 'sell';
-  /** Order size in $ */
+  /** Order size in shares (legacy field name retained for API compatibility) */
   size: number;
   /** Limit price (optional for market orders) */
   limitPrice?: number;
@@ -112,8 +132,9 @@ const DEFAULT_CONFIG: Required<SmartRouterConfig> = {
 // NOTE: These are defaults/estimates. Actual fees vary:
 // - Polymarket: 0 fees on most markets; 15-min crypto markets have dynamic fees (up to ~315bps at 50/50 odds)
 // - Kalshi: Formula-based fees 0.07*C*P*(1-P), averaging ~120bps, capped at ~200bps
-const PLATFORM_FEES: Partial<Record<Platform, { takerBps: number; makerBps: number }>> = {
-  polymarket: { takerBps: 0, makerBps: 0 }, // Zero fees on most markets (15-min crypto markets have dynamic fees)
+const PLATFORM_FEES: Partial<Record<Platform, { takerBps: number | null; makerBps: number }>> = {
+  // Polymarket taker fees are market/price dependent. null is deliberate: never default to zero.
+  polymarket: { takerBps: null, makerBps: 0 },
   kalshi: { takerBps: 120, makerBps: 17 }, // Average ~1.2% taker, ~0.17% maker (formula-based, varies by price)
   manifold: { takerBps: 0, makerBps: 0 }, // No fees
   metaculus: { takerBps: 0, makerBps: 0 }, // No fees
@@ -159,72 +180,15 @@ export function createSmartRouter(
     }
   }
 
-  async function fetchPrice(platform: Platform, marketId: string): Promise<number | null> {
-    try {
-      return await feeds.getPrice(platform, marketId);
-    } catch (error) {
-      logger.debug({ platform, marketId, error }, 'Failed to fetch price');
-      return null;
-    }
-  }
-
   // ==========================================================================
   // FEE CALCULATION
   // ==========================================================================
 
-  function calculateFees(platform: Platform, size: number, isMaker: boolean): number {
+  function calculateStaticFees(platform: Platform, notional: number, isMaker: boolean): number {
     const fees = PLATFORM_FEES[platform] || { takerBps: 100, makerBps: 0 };
     const bps = isMaker ? fees.makerBps : fees.takerBps;
-    return (size * bps) / 10000;
-  }
-
-  // ==========================================================================
-  // SLIPPAGE CALCULATION
-  // ==========================================================================
-
-  function calculateSlippage(
-    orderbook: Orderbook | null,
-    side: 'buy' | 'sell',
-    size: number,
-    limitPrice?: number
-  ): { fillPrice: number; slippage: number; availableSize: number } {
-    if (!orderbook) {
-      return { fillPrice: limitPrice || 0.5, slippage: 0, availableSize: 0 };
-    }
-
-    // Orderbook levels are [price, size] tuples
-    const levels = side === 'buy' ? orderbook.asks : orderbook.bids;
-    if (levels.length === 0) {
-      return { fillPrice: limitPrice || 0.5, slippage: 0, availableSize: 0 };
-    }
-
-    let remainingSize = size;
-    let totalCost = 0;
-    let filledSize = 0;
-
-    for (const [price, levelSize] of levels) {
-      const fillAmount = Math.min(remainingSize, levelSize);
-      totalCost += fillAmount * price;
-      filledSize += fillAmount;
-      remainingSize -= fillAmount;
-
-      if (remainingSize <= 0) break;
-    }
-
-    // If nothing was filled (e.g. all levels filtered by limit price), return zero
-    // to signal no liquidity rather than fabricating a price
-    if (filledSize === 0) {
-      return { fillPrice: 0, slippage: 0, availableSize: 0 };
-    }
-
-    const fillPrice = totalCost / filledSize;
-    const bestBid = orderbook.bids[0]?.[0];
-    const bestAsk = orderbook.asks[0]?.[0];
-    // Only compute slippage when both sides of the book exist
-    const midPrice = bestBid != null && bestAsk != null ? (bestBid + bestAsk) / 2 : fillPrice;
-    const slippage = midPrice > 0 ? Math.abs(fillPrice - midPrice) / midPrice * 100 : 0;
-
-    return { fillPrice, slippage, availableSize: filledSize };
+    if (bps === null) throw new Error(`${FEE_UNKNOWN}: ${platform} requires market fee metadata`);
+    return (notional * bps) / 10000;
   }
 
   // ==========================================================================
@@ -237,37 +201,67 @@ export function createSmartRouter(
   ): Promise<RouteQuote | null> {
     const marketId = params.alternativeIds?.[platform] || params.marketId;
 
-    // Fetch orderbook for slippage calculation
+    // Consume the executable side of the full book. No midpoint or last-trade fallback.
     const orderbook = await fetchOrderbook(platform, marketId);
-    const { fillPrice, slippage, availableSize } = calculateSlippage(
-      orderbook,
-      params.side,
-      params.size,
-      params.limitPrice
-    );
+    if (!orderbook) return null;
+    const fill = simulateBookFill({
+      book: orderbook,
+      side: params.side,
+      shares: params.size,
+      limitPrice: params.limitPrice,
+    });
+    const price = fill.vwap ?? params.limitPrice ?? 0;
 
-    // Skip if no liquidity
-    if (availableSize === 0 && !params.limitPrice) {
-      return null;
+    // A non-crossing limit can be a maker order, but its future fill/capacity is unknown.
+    const bestOpposite = params.side === 'buy' ? orderbook.asks[0]?.[0] : orderbook.bids[0]?.[0];
+    const isMaker = cfg.preferMaker && params.limitPrice !== undefined && bestOpposite !== undefined &&
+      (params.side === 'buy' ? params.limitPrice < bestOpposite : params.limitPrice > bestOpposite);
+
+    let feeStatus: FeeStatus = 'KNOWN';
+    let fees: number | null;
+    let blockReason: string | undefined;
+    if (platform === 'polymarket') {
+      // alternativeIds may be token IDs for books; Gamma fee metadata is keyed
+      // by the canonical condition/market ID, so try that first.
+      const canonicalMarket = await feeds.getMarket(params.marketId, platform).catch(() => null);
+      const market = canonicalMarket ?? (marketId !== params.marketId
+        ? await feeds.getMarket(marketId, platform).catch(() => null)
+        : null);
+      const fee = quotePolymarketFee({
+        shares: fill.filledSize,
+        price,
+        liquidityRole: isMaker ? 'maker' : 'taker',
+        feesEnabled: market?.feesEnabled,
+        feeSchedule: market?.feeSchedule,
+      });
+      feeStatus = fee.status;
+      fees = fee.fee;
+      if (fee.status === FEE_UNKNOWN) blockReason = `${FEE_UNKNOWN}: ${fee.reason}`;
+    } else {
+      fees = calculateStaticFees(platform, fill.spentOrReceived, isMaker);
     }
 
-    // Determine if we can be a maker
-    const canBeMaker = cfg.preferMaker && params.limitPrice !== undefined &&
-      ((params.side === 'buy' && params.limitPrice < fillPrice) ||
-        (params.side === 'sell' && params.limitPrice > fillPrice));
-
-    const isMaker = canBeMaker;
-    const fees = calculateFees(platform, params.size, isMaker);
-    const price = canBeMaker ? params.limitPrice! : fillPrice;
-    const netPrice = params.side === 'buy' ? price + fees / params.size : price - fees / params.size;
+    if (isMaker) blockReason = 'maker fill and capacity are not executable from the current book';
+    if (fill.status === 'none' && !blockReason) blockReason = 'no executable liquidity';
+    const executable = !isMaker && fill.filledSize > 0 && feeStatus === 'KNOWN';
+    const netPrice = executable && fees !== null && fill.filledSize > 0
+      ? params.side === 'buy'
+        ? price + fees / fill.filledSize
+        : price - fees / fill.filledSize
+      : null;
 
     return {
       platform,
       price,
-      availableSize: Math.max(availableSize, params.size), // If we have limit, assume we can fill
+      requestedSize: params.size,
+      availableSize: fill.filledSize,
       estimatedFees: fees,
       netPrice,
-      slippage,
+      feeStatus,
+      fillStatus: fill.status,
+      executable,
+      blockReason,
+      slippage: (fill.slippage ?? 0) * 100,
       executionTimeMs: EXECUTION_TIMES[platform] || 1000,
       isMaker,
     };
@@ -277,27 +271,27 @@ export function createSmartRouter(
   // ROUTE SELECTION
   // ==========================================================================
 
-  function selectBestRoute(quotes: RouteQuote[], side: 'buy' | 'sell', params: OrderRouteParams): RouteQuote {
+  function selectBestRoute(quotes: ExecutableRouteQuote[], side: 'buy' | 'sell', params: OrderRouteParams): ExecutableRouteQuote {
     const sorted = [...quotes].sort((a, b) => {
       switch (cfg.mode) {
         case 'best_price':
-          return side === 'buy' ? a.netPrice - b.netPrice : b.netPrice - a.netPrice;
+          return side === 'buy' ? a.netPrice! - b.netPrice! : b.netPrice! - a.netPrice!;
 
         case 'best_liquidity':
           return b.availableSize - a.availableSize;
 
         case 'lowest_fee':
-          return a.estimatedFees - b.estimatedFees;
+          return a.estimatedFees! - b.estimatedFees!;
 
         case 'balanced':
         default: {
           // Weighted score: 50% price, 30% liquidity (from orderbook), 20% fees
-          let scoreA = (side === 'buy' ? -a.netPrice : a.netPrice) * 0.5 +
+          let scoreA = (side === 'buy' ? -a.netPrice! : a.netPrice!) * 0.5 +
             a.availableSize / 10000 * 0.3 +
-            -a.estimatedFees / 100 * 0.2;
-          let scoreB = (side === 'buy' ? -b.netPrice : b.netPrice) * 0.5 +
+            -a.estimatedFees! / 100 * 0.2;
+          let scoreB = (side === 'buy' ? -b.netPrice! : b.netPrice!) * 0.5 +
             b.availableSize / 10000 * 0.3 +
-            -b.estimatedFees / 100 * 0.2;
+            -b.estimatedFees! / 100 * 0.2;
 
           // Add feature-based liquidity scoring (if enabled)
           if (cfg.useFeatureScoring) {
@@ -331,20 +325,20 @@ export function createSmartRouter(
   }
 
   function calculateSplitRoutes(
-    quotes: RouteQuote[],
+    quotes: ExecutableRouteQuote[],
     params: OrderRouteParams
-  ): RouteQuote[] | undefined {
+  ): ExecutableRouteQuote[] | undefined {
     if (!cfg.allowSplitting || quotes.length < 2) {
       return undefined;
     }
 
     // Sort by net price
     const sorted = [...quotes].sort((a, b) =>
-      params.side === 'buy' ? a.netPrice - b.netPrice : b.netPrice - a.netPrice
+      params.side === 'buy' ? a.netPrice! - b.netPrice! : b.netPrice! - a.netPrice!
     );
 
     // Calculate if splitting is beneficial
-    const splits: RouteQuote[] = [];
+    const splits: ExecutableRouteQuote[] = [];
     let remainingSize = params.size;
 
     for (let i = 0; i < Math.min(sorted.length, cfg.maxSplitPlatforms); i++) {
@@ -354,10 +348,16 @@ export function createSmartRouter(
       const fillSize = Math.min(remainingSize, quote.availableSize);
 
       if (fillSize > 0) {
+        const feeScale = quote.availableSize > 0 ? fillSize / quote.availableSize : 0;
+        const estimatedFees = quote.estimatedFees! * feeScale;
+        const netPrice = params.side === 'buy'
+          ? quote.price + estimatedFees / fillSize
+          : quote.price - estimatedFees / fillSize;
         splits.push({
           ...quote,
           availableSize: fillSize,
-          estimatedFees: calculateFees(quote.platform, fillSize, quote.isMaker),
+          estimatedFees,
+          netPrice,
         });
         remainingSize -= fillSize;
       }
@@ -368,8 +368,8 @@ export function createSmartRouter(
       return undefined;
     }
 
-    const singleCost = sorted[0].netPrice * params.size;
-    const splitCost = splits.reduce((sum, s) => sum + s.netPrice * s.availableSize, 0);
+    const singleCost = sorted[0].netPrice! * params.size;
+    const splitCost = splits.reduce((sum, s) => sum + s.netPrice! * s.availableSize, 0);
     const improvement = (singleCost - splitCost) / singleCost * 100;
 
     if (improvement < cfg.minSplitImprovement) {
@@ -386,25 +386,31 @@ export function createSmartRouter(
   Object.assign(emitter, {
     async findBestRoute(params: OrderRouteParams): Promise<RoutingResult> {
       const quotes = await emitter.getQuotes(params);
+      const executableQuotes = quotes.filter(
+        (quote): quote is ExecutableRouteQuote =>
+          quote.executable && quote.netPrice !== null && quote.estimatedFees !== null && quote.feeStatus === 'KNOWN'
+      );
 
-      if (quotes.length === 0) {
-        const error = new Error('No routes available');
+      if (executableQuotes.length === 0) {
+        const feeUnknown = quotes.some((quote) => quote.feeStatus === FEE_UNKNOWN);
+        const error = new Error(feeUnknown ? `${FEE_UNKNOWN}: no fee-safe routes available` : 'No executable routes available');
         emitter.emit('routingFailed', error, params);
         throw error;
       }
 
-      const bestRoute = selectBestRoute(quotes, params.side, params);
-      const splitRoutes = calculateSplitRoutes(quotes, params);
+      const bestRoute = selectBestRoute(executableQuotes, params.side, params);
+      const splitRoutes = calculateSplitRoutes(executableQuotes, params);
 
       // Calculate savings compared to worst route
       const worstPrice = params.side === 'buy'
-        ? Math.max(...quotes.map((q) => q.netPrice))
-        : Math.min(...quotes.map((q) => q.netPrice));
-      const totalSavings = Math.abs(bestRoute.netPrice - worstPrice) * params.size;
+        ? Math.max(...executableQuotes.map((q) => q.netPrice!))
+        : Math.min(...executableQuotes.map((q) => q.netPrice!));
+      const totalSavings = Math.abs(bestRoute.netPrice! - worstPrice) * params.size;
 
       const result: RoutingResult = {
         bestRoute,
-        allRoutes: quotes,
+        allRoutes: executableQuotes,
+        blockedRoutes: quotes.filter((quote) => !quote.executable),
         splitRoutes,
         totalSavings,
         recommendation: splitRoutes

@@ -20,6 +20,7 @@ import { join, basename } from 'path';
 import { homedir } from 'os';
 import { generateId as generateSecureId } from '../utils/id';
 import { logger } from '../utils/logger';
+import { resolveStateDir } from '../utils/config';
 import type { IncomingMessage, OutgoingMessage, Session } from '../types';
 
 // =============================================================================
@@ -1036,7 +1037,7 @@ export function createSystemPromptInjector(
 export const hooks = createHooksService();
 
 export function getHooksDir(): string {
-  return join(homedir(), '.clodds', 'hooks');
+  return join(resolveStateDir(), 'hooks');
 }
 
 export function getHooksStatePath(): string {

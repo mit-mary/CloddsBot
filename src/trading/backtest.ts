@@ -15,6 +15,15 @@ import type { Platform } from '../types';
 import type { Strategy, StrategyContext, Signal } from './bots/index';
 import type { Trade } from './logger';
 import type { Tick, OrderbookSnapshot, TickRecorder } from '../services/tick-recorder/types';
+import {
+  FEE_UNKNOWN,
+  quotePolymarketFee,
+  simulateBookFill,
+  type FeeStatus,
+  type PolymarketFeeContext,
+} from '../execution/prediction-market-economics';
+import { TRUSTED_TICK_REPLAY_EXECUTION_MODE } from '../safety/paper-only';
+import type { PnlNamespace, PnlSource } from '../safety/trusted-shadow-ledger';
 
 // =============================================================================
 // TYPES
@@ -56,6 +65,10 @@ export interface BacktestTrade {
   size: number;
   commission: number;
   slippage: number;
+  requestedSize?: number;
+  unfilledSize?: number;
+  fillStatus?: 'full' | 'partial' | 'none';
+  feeStatus?: FeeStatus;
   pnl?: number;
   signal?: Signal;
 }
@@ -75,6 +88,23 @@ export interface BacktestResult {
   dailyReturns: Array<{ date: string; return: number }>;
   /** Drawdown series */
   drawdowns: Array<{ timestamp: Date; drawdownPct: number }>;
+  /** Signals rejected because executable depth, cash, position, or fee facts were unavailable. */
+  rejections?: BacktestRejection[];
+  /** Mandatory provenance prevents legacy/bar PnL from entering trusted analytics. */
+  pnlNamespace: PnlNamespace;
+  pnlSource: PnlSource;
+}
+
+export interface BacktestRejection {
+  timestamp: Date;
+  side: 'buy' | 'sell';
+  requestedSize: number;
+  reason: string;
+  status?: 'no-fill' | 'incomplete';
+  filledSize?: number;
+  fillPrice?: number | null;
+  vwap?: number | null;
+  bookStatus?: 'missing' | 'stale';
 }
 
 export interface BacktestMetrics {
@@ -176,6 +206,13 @@ export interface TickReplayConfig extends BacktestConfig {
   priceHistorySize: number;
   /** Include orderbook data in strategy context (default: true if orderbooks provided) */
   includeOrderbook: boolean;
+  /**
+   * Trusted mode requires an executable book. The legacy mode is retained only
+   * for compatibility and must never be reported as execution-realistic PnL.
+   */
+  executionMode?: 'trusted-orderbook' | 'legacy-tick-price-non-realistic';
+  /** Exchange-provided Polymarket fee metadata. Unknown taker fees block execution. */
+  polymarketFees?: PolymarketFeeContext;
 }
 
 export interface MonteCarloResult {
@@ -217,6 +254,7 @@ const DEFAULT_TICK_REPLAY: Omit<TickReplayConfig, keyof BacktestConfig> = {
   evalIntervalMs: 5_000,
   priceHistorySize: 200,
   includeOrderbook: true,
+  executionMode: TRUSTED_TICK_REPLAY_EXECUTION_MODE,
 };
 
 export function createBacktestEngine(db: Database): BacktestEngine {
@@ -593,6 +631,8 @@ export function createBacktestEngine(db: Database): BacktestEngine {
       return {
         strategyId: strategy.config.id,
         config: cfg,
+        pnlNamespace: 'legacy-research',
+        pnlSource: 'bar-backtest',
         metrics,
         trades,
         equityCurve,
@@ -688,8 +728,13 @@ export function createBacktestEngine(db: Database): BacktestEngine {
         return obIndex[best];
       }
 
+      function classifyMissingOrderbook(ts: number): 'missing' | 'stale' {
+        return obIndex.some((snapshot) => snapshot.time.getTime() <= ts) ? 'stale' : 'missing';
+      }
+
       // Simulation state
       const trades: BacktestTrade[] = [];
+      const rejections: BacktestRejection[] = [];
       const equityCurve: Array<{ timestamp: Date; equity: number }> = [];
       const positions = new Map<string, { shares: number; avgPrice: number; entryTime: Date }>();
       const priceHistory: number[] = [];
@@ -766,15 +811,62 @@ export function createBacktestEngine(db: Database): BacktestEngine {
 
         // Execute signals
         for (const signal of signals) {
-          const fillPrice = tick.price;
           if (signal.type === 'buy') {
-            const size = signal.size || Math.floor(cash * 0.1 / fillPrice);
-            if (size <= 0) continue;
+            const requestedSize = signal.size || Math.floor(cash * 0.1 / tick.price);
+            if (requestedSize <= 0) continue;
 
-            const commission = size * fillPrice * (cfg.commissionPct / 100);
-            const slippage = size * fillPrice * (cfg.slippagePct / 100);
-            const cost = size * fillPrice + commission + slippage;
-            if (cost > cash) continue;
+            if (!ob && cfg.executionMode === 'trusted-orderbook') {
+              rejections.push({
+                timestamp: tick.time,
+                side: 'buy',
+                requestedSize,
+                reason: 'NO_ORDERBOOK_NO_FILL',
+                status: 'no-fill',
+                filledSize: 0,
+                fillPrice: null,
+                vwap: null,
+                bookStatus: classifyMissingOrderbook(tickTime),
+              });
+              continue;
+            }
+
+            const fill = ob ? simulateBookFill({
+              book: { bids: ob.bids, asks: ob.asks, timestamp: ob.time.getTime() },
+              side: 'buy',
+              shares: requestedSize,
+              safetySlippageBps: Math.max(0, Math.round(cfg.slippagePct * 100)),
+            }) : null;
+            if (fill?.status === 'none') {
+              rejections.push({ timestamp: tick.time, side: 'buy', requestedSize, reason: 'NO_FILL' });
+              continue;
+            }
+
+            const size = fill?.filledSize ?? requestedSize;
+            const fillPrice = fill?.vwap ?? tick.price;
+            const notional = fill?.spentOrReceived ?? size * fillPrice;
+            const slippage = fill
+              ? Math.max(0, notional - size * (fill.bestPrice ?? fillPrice))
+              : notional * (cfg.slippagePct / 100);
+            const requiresPolymarketFeeFacts = cfg.platform === 'polymarket' &&
+              (cfg.executionMode === 'trusted-orderbook' || cfg.polymarketFees !== undefined);
+            const fee = requiresPolymarketFeeFacts
+              ? quotePolymarketFee({
+                  shares: size,
+                  price: fillPrice,
+                  liquidityRole: 'taker',
+                  ...(cfg.polymarketFees ?? {}),
+                })
+              : { status: 'KNOWN' as const, fee: notional * (cfg.commissionPct / 100) };
+            if (fee.status === FEE_UNKNOWN || fee.fee === null) {
+              rejections.push({ timestamp: tick.time, side: 'buy', requestedSize, reason: FEE_UNKNOWN });
+              continue;
+            }
+            const commission = fee.fee;
+            const cost = notional + commission + (fill ? 0 : slippage);
+            if (cost > cash) {
+              rejections.push({ timestamp: tick.time, side: 'buy', requestedSize, reason: 'INSUFFICIENT_CASH' });
+              continue;
+            }
 
             cash -= cost;
 
@@ -797,6 +889,10 @@ export function createBacktestEngine(db: Database): BacktestEngine {
               size,
               commission,
               slippage,
+              requestedSize,
+              unfilledSize: fill?.unfilledSize ?? 0,
+              fillStatus: fill?.status ?? 'full',
+              feeStatus: fee.status,
               signal,
             };
             trades.push(trade);
@@ -807,11 +903,53 @@ export function createBacktestEngine(db: Database): BacktestEngine {
             const position = positions.get(posKey);
             if (!position || position.shares <= 0) continue;
 
-            const size = signal.size || position.shares;
-            const actualSize = Math.min(size, position.shares);
-            const commission = actualSize * fillPrice * (cfg.commissionPct / 100);
-            const slippage = actualSize * fillPrice * (cfg.slippagePct / 100);
-            const proceeds = actualSize * fillPrice - commission - slippage;
+            const requestedSize = Math.min(signal.size || position.shares, position.shares);
+            if (!ob && cfg.executionMode === 'trusted-orderbook') {
+              rejections.push({
+                timestamp: tick.time,
+                side: 'sell',
+                requestedSize,
+                reason: 'NO_ORDERBOOK_NO_FILL',
+                status: 'no-fill',
+                filledSize: 0,
+                fillPrice: null,
+                vwap: null,
+                bookStatus: classifyMissingOrderbook(tickTime),
+              });
+              continue;
+            }
+            const fill = ob ? simulateBookFill({
+              book: { bids: ob.bids, asks: ob.asks, timestamp: ob.time.getTime() },
+              side: 'sell',
+              shares: requestedSize,
+              safetySlippageBps: Math.max(0, Math.round(cfg.slippagePct * 100)),
+            }) : null;
+            if (fill?.status === 'none') {
+              rejections.push({ timestamp: tick.time, side: 'sell', requestedSize, reason: 'NO_FILL' });
+              continue;
+            }
+            const actualSize = fill?.filledSize ?? requestedSize;
+            const fillPrice = fill?.vwap ?? tick.price;
+            const notional = fill?.spentOrReceived ?? actualSize * fillPrice;
+            const slippage = fill
+              ? Math.max(0, actualSize * (fill.bestPrice ?? fillPrice) - notional)
+              : notional * (cfg.slippagePct / 100);
+            const requiresPolymarketFeeFacts = cfg.platform === 'polymarket' &&
+              (cfg.executionMode === 'trusted-orderbook' || cfg.polymarketFees !== undefined);
+            const fee = requiresPolymarketFeeFacts
+              ? quotePolymarketFee({
+                  shares: actualSize,
+                  price: fillPrice,
+                  liquidityRole: 'taker',
+                  ...(cfg.polymarketFees ?? {}),
+                })
+              : { status: 'KNOWN' as const, fee: notional * (cfg.commissionPct / 100) };
+            if (fee.status === FEE_UNKNOWN || fee.fee === null) {
+              rejections.push({ timestamp: tick.time, side: 'sell', requestedSize, reason: FEE_UNKNOWN });
+              continue;
+            }
+            const commission = fee.fee;
+            const proceeds = notional - commission - (fill ? 0 : slippage);
             const pnl = proceeds - actualSize * position.avgPrice;
 
             cash += proceeds;
@@ -828,6 +966,10 @@ export function createBacktestEngine(db: Database): BacktestEngine {
               size: actualSize,
               commission,
               slippage,
+              requestedSize,
+              unfilledSize: fill?.unfilledSize ?? 0,
+              fillStatus: fill?.status ?? 'full',
+              feeStatus: fee.status,
               pnl,
               signal,
             };
@@ -896,11 +1038,16 @@ export function createBacktestEngine(db: Database): BacktestEngine {
       return {
         strategyId: strategy.config.id,
         config: cfg,
+        pnlNamespace: cfg.executionMode === 'trusted-orderbook' ? 'trusted-shadow' : 'legacy-research',
+        pnlSource: cfg.executionMode === 'trusted-orderbook'
+          ? 'trusted-orderbook-tick-execution'
+          : 'legacy-tick-price-non-realistic',
         metrics,
         trades,
         equityCurve,
         dailyReturns,
         drawdowns,
+        rejections,
       };
     },
 
@@ -950,9 +1097,16 @@ export function createBacktestEngine(db: Database): BacktestEngine {
 }
 
 function emptyResult(strategyId: string, config: BacktestConfig): BacktestResult {
+  const executionMode = (config as TickReplayConfig).executionMode;
   return {
     strategyId,
     config,
+    pnlNamespace: executionMode === 'trusted-orderbook' ? 'trusted-shadow' : 'legacy-research',
+    pnlSource: executionMode === 'trusted-orderbook'
+      ? 'trusted-orderbook-tick-execution'
+      : executionMode === 'legacy-tick-price-non-realistic'
+        ? 'legacy-tick-price-non-realistic'
+        : 'bar-backtest',
     metrics: {
       totalReturnPct: 0, annualizedReturnPct: 0, totalTrades: 0,
       winRate: 0, profitFactor: 0, avgTradePct: 0, avgWinPct: 0, avgLossPct: 0,
@@ -963,5 +1117,6 @@ function emptyResult(strategyId: string, config: BacktestConfig): BacktestResult
     equityCurve: [],
     dailyReturns: [],
     drawdowns: [],
+    rejections: [],
   };
 }

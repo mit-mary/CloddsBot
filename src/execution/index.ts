@@ -481,8 +481,9 @@ export async function getPolymarketNegRiskCached(tokenId: string): Promise<boole
 }
 
 /**
- * Get fee rate in basis points for a token
- * Crypto 15-min markets have higher fees due to negative risk
+ * Get the exchange-provided fee rate in basis points for a token.
+ * A failed/malformed lookup is FEE_UNKNOWN and must fail closed; neg-risk is
+ * not a fee schedule and zero must never be inferred from it.
  */
 export async function getPolymarketFeeRate(tokenId: string): Promise<number> {
   // Check cache
@@ -492,17 +493,20 @@ export async function getPolymarketFeeRate(tokenId: string): Promise<number> {
   }
 
   try {
-    // Fee rate depends on neg_risk status
-    // Standard markets: 0 bps maker, ~2% taker
-    // Neg risk (crypto): higher fees
-    const negRisk = await getPolymarketNegRiskCached(tokenId);
-    // Polymarket fee formula for neg risk: shares × 0.25 × (price × (1 - price))²
-    // Simplified: ~0-50 bps depending on price
-    const feeRateBps = negRisk ? 25 : 0; // Approximate - actual varies by price
+    const response = await fetch(`${POLY_CLOB_URL}/fee-rate?token_id=${encodeURIComponent(tokenId)}`);
+    if (!response.ok) {
+      throw new Error(`fee-rate endpoint returned ${response.status}`);
+    }
+    const data = await response.json() as { fee_rate_bps?: number | string; base_fee?: number | string };
+    const raw = data.fee_rate_bps ?? data.base_fee;
+    const feeRateBps = Number(raw);
+    if (raw === undefined || !Number.isFinite(feeRateBps) || feeRateBps < 0) {
+      throw new Error('fee-rate response did not contain a valid fee rate');
+    }
     feeRateCache.set(tokenId, { feeRateBps, cachedAt: Date.now() });
     return feeRateBps;
-  } catch {
-    return 0;
+  } catch (error) {
+    throw new Error(`FEE_UNKNOWN for Polymarket token ${tokenId}`, { cause: error });
   }
 }
 
@@ -3649,6 +3653,7 @@ export const POLYMARKET_EXCHANGES = {
 
 // Re-export sub-modules
 export * from './smart-router';
+export * from './prediction-market-economics';
 export * from './mev-protection';
 export * from './circuit-breaker';
 export * from './position-manager';

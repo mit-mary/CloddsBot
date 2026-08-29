@@ -47,6 +47,14 @@ export interface Market {
   url: string;
   createdAt: Date;
   updatedAt: Date;
+  /** Exchange-provided fee state. Missing metadata is not equivalent to zero. */
+  feesEnabled?: boolean;
+  feeSchedule?: {
+    rate: number;
+    exponent?: number;
+    takerOnly?: boolean;
+    rebateRate?: number;
+  } | null;
 }
 
 export interface Outcome {
@@ -775,6 +783,10 @@ export interface Skill {
 export interface SkillManagerConfig {
   /** Only load these bundled skills (whitelist). If undefined, load all. */
   allowBundled?: string[];
+  /** Only expose these skill names from any enabled source. */
+  allowSkills?: string[];
+  /** Ignore extra, managed, and workspace skills. */
+  bundledOnly?: boolean;
   /** Extra directories to scan for skills */
   extraDirs?: string[];
   /** Watch for file changes and hot-reload */

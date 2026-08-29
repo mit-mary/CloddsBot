@@ -25,10 +25,12 @@ import {
   ManifoldCredentials,
   Market,
   ExecutionServiceRef,
+  SkillManagerConfig,
 } from '../types';
 import { logger } from '../utils/logger';
 import { ToolRegistry, inferToolMetadata, CORE_TOOL_NAMES, detectToolHints, type ToolMetadata } from './tool-registry.js';
 import { createSkillManager, SkillManager } from '../skills/loader';
+import { PAPER_ONLY, filterPaperAgentTools, paperSkillManagerConfig } from '../safety/paper-only';
 import { FeedManager } from '../feeds';
 import { Database } from '../db';
 import type { CredentialsManager } from '../types';
@@ -215,6 +217,15 @@ export interface AgentManager {
   reloadConfig: (config: Config) => void;
   /** Get enabled skill names + descriptions for command palette */
   getSkillCommands: () => Array<{ name: string; description: string; subcommands?: Array<{ name: string; description: string; category: string }> }>;
+  /** Read-only proof of the actual paper skill manager and tool registry in use. */
+  getPaperBoundaryDiagnostics: () => PaperAgentBoundaryDiagnostics;
+}
+
+export interface PaperAgentBoundaryDiagnostics {
+  skillManagerConfig: SkillManagerConfig | undefined;
+  loadedSkills: Array<{ name: string; path: string }>;
+  registeredToolNames: string[];
+  toolSearch: (query: string) => string[];
 }
 
 const SYSTEM_PROMPT = `You are Clodds, an AI assistant for prediction markets. Claude + Odds.
@@ -17012,7 +17023,11 @@ export async function createAgentManager(
   }
 
   const client = new Anthropic({ apiKey });
-  const skills = createSkillManager(config.agents.defaults.workspace);
+  const skillManagerConfig = PAPER_ONLY ? paperSkillManagerConfig() : undefined;
+  const skills = createSkillManager(
+    config.agents.defaults.workspace,
+    skillManagerConfig,
+  );
   let credentials: CredentialsManager;
   try {
     const createCredentialsManager = await _loadCredentials();
@@ -17085,7 +17100,7 @@ export async function createAgentManager(
       parseMode: 'Markdown',
     });
   });
-  const allToolDefs = buildTools();
+  const allToolDefs = filterPaperAgentTools(buildTools());
 
   // Build tool registry with inferred metadata
   const toolRegistry = new ToolRegistry<ToolDefinition>();
@@ -18200,6 +18215,15 @@ export async function createAgentManager(
 
   return {
     handleMessage,
+    getPaperBoundaryDiagnostics() {
+      return {
+        skillManagerConfig,
+        loadedSkills: [...skills.skills.values()].map(({ name, path }) => ({ name, path })),
+        registeredToolNames: allToolDefs.map(({ name }) => name),
+        // This is the same registry captured by the runtime tool_search handler.
+        toolSearch: (query: string) => toolRegistry.searchByText(query).map(({ name }) => name),
+      };
+    },
     dispose() {
       // Cleanup rate limit interval
       clearInterval(rateLimitCleanupInterval);
