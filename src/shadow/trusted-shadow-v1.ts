@@ -253,6 +253,14 @@ function hashJson(value: unknown): string {
   return createHash('sha256').update(JSON.stringify(value)).digest('hex');
 }
 
+function describeError(error: unknown): string {
+  if (!(error instanceof Error)) return String(error);
+  const cause = error.cause instanceof Error
+    ? `${error.cause.name}: ${error.cause.message}${'code' in error.cause ? ` code=${String(error.cause.code)}` : ''}`
+    : error.cause === undefined ? '' : String(error.cause);
+  return cause ? `${error.name}: ${error.message}; cause=${cause}` : `${error.name}: ${error.message}`;
+}
+
 function durableAppend(path: string, line: string): void {
   const fd = openSync(path, 'a');
   try {
@@ -482,8 +490,12 @@ function writeReports(manifest: RunManifest, config: TrustedShadowConfig): void 
     `\n## Latency stress\n\n| Latency | Evaluated | Leg 2 available | Complete | Partial leg 2 | Zero leg 2 | Trusted records | PnL sum |\n|---|---:|---:|---:|---:|---:|---:|---:|\n${latencyRows || '| N/A | 0 | 0 | 0 | 0 | 0 | 0 | 0 |'}\n` +
     `\nEach trusted event retains theoretical edge, depth impact, fees, safety slippage, latency decay, leg-risk residual, matched and unhedged quantity. Aggregate sums are never the sole stored record.\n`, 'utf8');
   const enough24h = hours >= 20;
+  const reportStatus = manifest.stopReasons.length > 0
+    ? 'BLOCKED'
+    : enough24h ? 'INTERIM_READY' : 'PENDING';
   writeFileSync(join(config.reportsDir, 'SHADOW_24H_REPORT.md'), `# Shadow 24H Report\n\n` +
-    `Status: ${enough24h ? (manifest.stopReasons.length ? 'PAUSED' : 'INTERIM_READY') : 'PENDING'}\n\n` +
+    `Status: ${reportStatus}\n\n` +
+    `Stop reasons: ${manifest.stopReasons.join(', ') || 'none'}.\n\n` +
     `Observed hours: ${hours.toFixed(3)}. This file does not claim profitability; the sample is ` +
     `${enough24h ? 'eligible for an interim quality review' : 'not yet a 24-hour sample'}.\n`, 'utf8');
   if (hours >= 48) {
@@ -631,7 +643,7 @@ export class TrustedShadowV1Runner {
     } catch (error) {
       stats.marketFetchFailure += 1;
       stats.errors += 1;
-      this.writer.append({ eventType: 'error', scope: 'market_batch', error: String(error) });
+      this.writer.append({ eventType: 'error', scope: 'market_batch', error: describeError(error) });
       return;
     }
 
@@ -663,7 +675,7 @@ export class TrustedShadowV1Runner {
       } catch (error) {
         stats.missingBooks += 2;
         stats.errors += 1;
-        this.writer.append({ eventType: 'error', scope: 'paired_books', marketId, tokenIds, error: String(error) });
+        this.writer.append({ eventType: 'error', scope: 'paired_books', marketId, tokenIds, error: describeError(error) });
         continue;
       }
 
@@ -755,7 +767,7 @@ export class TrustedShadowV1Runner {
         } catch (error) {
           stats.missingBooks += 1;
           stats.errors += 1;
-          this.writer.append({ eventType: 'error', scope: 'second_leg', marketId, latencyMs, error: String(error) });
+          this.writer.append({ eventType: 'error', scope: 'second_leg', marketId, latencyMs, error: describeError(error) });
         }
       }
 
@@ -855,8 +867,8 @@ export class TrustedShadowV1Runner {
       return this.manifest;
     } catch (error) {
       this.manifest.status = 'blocked';
-      this.manifest.stopReasons = [`RUNTIME_ERROR: ${String(error)}`];
-      this.writer.append({ eventType: 'runtime_error', error: String(error) });
+      this.manifest.stopReasons = [`RUNTIME_ERROR: ${describeError(error)}`];
+      this.writer.append({ eventType: 'runtime_error', error: describeError(error) });
       this.syncSequence();
       throw error;
     }
