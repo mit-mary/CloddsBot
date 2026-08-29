@@ -19,6 +19,13 @@ function marketBatch(): unknown[] {
   }];
 }
 
+function pairedBooks(): unknown[] {
+  return [
+    { asset_id: 'token-yes', timestamp: '1000', hash: 'yes-hash', bids: [], asks: [{ price: '0.6', size: '10' }] },
+    { asset_id: 'token-no', timestamp: '1000', hash: 'no-hash', bids: [{ price: '0.4', size: '10' }], asks: [] },
+  ];
+}
+
 describe('trusted shadow public-data network preflight', () => {
   it('requires valid Gamma metadata and a real CLOB book', async () => {
     const urls: string[] = [];
@@ -26,7 +33,7 @@ describe('trusted shadow public-data network preflight', () => {
       urls.push(String(input));
       return urls.length === 1
         ? jsonResponse(marketBatch())
-        : jsonResponse({ bids: [{ price: '0.4', size: '10' }], asks: [{ price: '0.6', size: '10' }] });
+        : jsonResponse(pairedBooks());
     }) as typeof fetch;
     const result = await runPublicDataPreflight({
       timeoutMs: 1000, maxAttempts: 3, initialBackoffMs: 1, fetchImpl,
@@ -39,7 +46,7 @@ describe('trusted shadow public-data network preflight', () => {
     assert.equal(result.clobBidLevels, 1);
     assert.equal(result.clobAskLevels, 1);
     assert.match(urls[0], /^https:\/\/gamma-api\.polymarket\.com\/markets\?/);
-    assert.equal(urls[1], 'https://clob.polymarket.com/book?token_id=token-yes');
+    assert.equal(urls[1], 'https://clob.polymarket.com/books');
   });
 
   it('classifies required HTTP and invalid-response failure modes', async () => {
@@ -81,7 +88,7 @@ describe('trusted shadow public-data network preflight', () => {
       calls += 1;
       if (calls <= 2) throw timeout();
       if (calls === 3) return jsonResponse(marketBatch());
-      return jsonResponse({ bids: [{}], asks: [{}] });
+      return jsonResponse(pairedBooks());
     }) as typeof fetch;
     const result = await runPublicDataPreflight({
       timeoutMs: 1000, maxAttempts: 3, initialBackoffMs: 100, fetchImpl,

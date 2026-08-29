@@ -1,5 +1,6 @@
 export const GAMMA_MARKETS_URL = 'https://gamma-api.polymarket.com/markets';
 export const CLOB_BOOK_URL = 'https://clob.polymarket.com/book';
+export const CLOB_BOOKS_URL = 'https://clob.polymarket.com/books';
 
 export type PreflightFailure =
   | 'DNS_FAILURE'
@@ -146,12 +147,18 @@ async function checkedJson(
   attempt: number,
   timeoutMs: number,
   fetchImpl: typeof fetch,
+  init: { method?: 'GET' | 'POST'; body?: string } = {},
 ): Promise<CheckedJson> {
   const startedAt = Date.now();
   try {
     const response = await fetchImpl(url, {
-      method: 'GET',
-      headers: { Accept: 'application/json', 'User-Agent': 'clodds-trusted-shadow-v1-preflight' },
+      method: init.method ?? 'GET',
+      body: init.body,
+      headers: {
+        Accept: 'application/json',
+        ...(init.body ? { 'Content-Type': 'application/json' } : {}),
+        'User-Agent': 'clodds-trusted-shadow-v1-preflight',
+      },
       signal: AbortSignal.timeout(timeoutMs),
     });
     const failure = httpFailure(response.status);
@@ -214,10 +221,12 @@ function marketCandidates(body: unknown): MarketCandidate[] {
   return candidates;
 }
 
-function validBook(body: unknown): body is { bids: unknown[]; asks: unknown[] } {
+function validBook(body: unknown): body is { asset_id: string; timestamp: string | number; hash: string; bids: unknown[]; asks: unknown[] } {
   if (typeof body !== 'object' || body === null) return false;
-  const book = body as { bids?: unknown; asks?: unknown };
-  return Array.isArray(book.bids) && Array.isArray(book.asks) && book.bids.length > 0 && book.asks.length > 0;
+  const book = body as { asset_id?: unknown; timestamp?: unknown; hash?: unknown; bids?: unknown; asks?: unknown };
+  return typeof book.asset_id === 'string' && book.asset_id.length > 0 &&
+    Number.isFinite(Number(book.timestamp)) && typeof book.hash === 'string' && book.hash.length > 0 &&
+    Array.isArray(book.bids) && Array.isArray(book.asks);
 }
 
 export async function runPublicDataPreflight(
@@ -265,33 +274,34 @@ export async function runPublicDataPreflight(
 
     let lastClobFailure: PreflightAttempt | null = null;
     for (const candidate of candidates.slice(0, 5)) {
-      for (const tokenId of candidate.tokenIds) {
-        const clob = await checkedJson(
-          `${CLOB_BOOK_URL}?token_id=${encodeURIComponent(tokenId)}`,
-          'clob', attempt, options.timeoutMs, fetchImpl,
-        );
-        if (clob.success && validBook(clob.body)) {
-          observations.push(clob.observation);
-          return {
-            success: true, attemptsUsed: attempt, failure: null,
-            marketId: candidate.marketId, tokenId,
-            gammaMarketCount: Array.isArray(gamma.body) ? gamma.body.length : 0,
-            clobBidLevels: clob.body.bids.length, clobAskLevels: clob.body.asks.length,
-            observations,
-          };
-        }
-        if (clob.success) {
-          const invalid: PreflightAttempt = {
-            attempt, source: 'clob', success: false, httpStatus: clob.observation.httpStatus,
-            elapsedMs: clob.observation.elapsedMs, failure: 'INVALID_RESPONSE',
-            errorCode: null, retryable: false,
-          };
-          observations.push(invalid);
-          lastClobFailure = invalid;
-        } else {
-          observations.push(clob.observation);
-          lastClobFailure = clob.observation;
-        }
+      const clob = await checkedJson(
+        CLOB_BOOKS_URL, 'clob', attempt, options.timeoutMs, fetchImpl,
+        { method: 'POST', body: JSON.stringify(candidate.tokenIds.map((token_id) => ({ token_id }))) },
+      );
+      const books = Array.isArray(clob.body) ? clob.body.filter(validBook) : [];
+      const byToken = new Map(books.map((book) => [book.asset_id, book]));
+      if (clob.success && candidate.tokenIds.every((tokenId) => byToken.has(tokenId))) {
+        observations.push(clob.observation);
+        return {
+          success: true, attemptsUsed: attempt, failure: null,
+          marketId: candidate.marketId, tokenId: candidate.tokenIds[0],
+          gammaMarketCount: Array.isArray(gamma.body) ? gamma.body.length : 0,
+          clobBidLevels: books.reduce((sum, book) => sum + book.bids.length, 0),
+          clobAskLevels: books.reduce((sum, book) => sum + book.asks.length, 0),
+          observations,
+        };
+      }
+      if (clob.success) {
+        const invalid: PreflightAttempt = {
+          attempt, source: 'clob', success: false, httpStatus: clob.observation.httpStatus,
+          elapsedMs: clob.observation.elapsedMs, failure: 'INVALID_RESPONSE',
+          errorCode: null, retryable: false,
+        };
+        observations.push(invalid);
+        lastClobFailure = invalid;
+      } else {
+        observations.push(clob.observation);
+        lastClobFailure = clob.observation;
       }
     }
     finalFailure = lastClobFailure?.failure ?? 'INVALID_RESPONSE';

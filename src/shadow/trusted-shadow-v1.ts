@@ -34,6 +34,21 @@ export const SHADOW_V1_OPPORTUNITY_SOURCE = 'opportunity-executable-economics' a
 
 const GAMMA_MARKETS = 'https://gamma-api.polymarket.com/markets';
 const CLOB_BOOK = 'https://clob.polymarket.com/book';
+const CLOB_BOOKS = 'https://clob.polymarket.com/books';
+
+export type BookTopologyState =
+  | 'TWO_SIDED'
+  | 'ONE_SIDED_BID_ONLY'
+  | 'ONE_SIDED_ASK_ONLY'
+  | 'EMPTY_BOOK';
+
+export type BookObservationState = BookTopologyState
+  | 'MISSING_BOOK'
+  | 'INVALID_RESPONSE'
+  | 'REQUEST_FAILED'
+  | 'TRANSPORT_STALE';
+
+export type BookHashChange = 'INITIAL' | 'SAME' | 'CHANGED' | 'UNAVAILABLE';
 
 interface GammaMarket {
   id?: string | number;
@@ -74,6 +89,11 @@ export interface TrustedShadowConfig {
   safetySlippageBps: number;
   staleAfterMs: number;
   maxPairGapMs: number;
+  discoveryLimit?: number;
+  minimumQualityMarkets?: number;
+  minimumQualityPairs?: number;
+  minimumQualityCycles?: number;
+  transportStaleAfterMs?: number;
   sizesUsd?: readonly number[];
   latenciesMs?: readonly number[];
   resume?: boolean;
@@ -87,6 +107,34 @@ export interface ShadowStats {
   marketFetchSuccess: number;
   marketFetchFailure: number;
   marketsSeen: number;
+  marketsDiscovered: number;
+  metadataValidMarkets: number;
+  marketsSampled: number;
+  bookPairRequests: number;
+  bookPairResponses: number;
+  bookResponsesObtained: number;
+  schemaValidBooks: number;
+  transportFreshBooks: number;
+  transportStaleBooks: number;
+  twoSidedBooks: number;
+  oneSidedBidOnlyBooks: number;
+  oneSidedAskOnlyBooks: number;
+  emptyBooks: number;
+  missingBookResponses: number;
+  invalidBookResponses: number;
+  requestFailedBooks: number;
+  hashInitial: number;
+  hashSame: number;
+  hashChanged: number;
+  reliableBookPairs: number;
+  unreliableBookPairs: number;
+  pairedStrategyEligible: number;
+  pairedStrategyIneligible: number;
+  requiredExecutableSidesPairs: number;
+  enoughDepthPairs: number;
+  feeCoveredPairs: number;
+  executableCandidateMarkets: number;
+  strategyRejectionReasons: Record<string, number>;
   booksAttempted: number;
   completeBooks: number;
   missingBooks: number;
@@ -149,18 +197,28 @@ export interface RunManifest {
   processStarts: ProcessStart[];
   recoveredIncompleteEventRanges: Array<{ fromSequence: number; toSequence: number; recoveredAt: string }>;
   networkPreflight?: PublicDataPreflightResult;
+  bookHashState: Record<string, { hash: string; lastChangedAtMs: number }>;
 }
 
-interface BookObservation {
+export interface BookObservation {
   tokenId: string;
   sourceTimestampMs: number | null;
-  receiveStartedAtMs: number;
-  receiveCompletedAtMs: number;
-  rawRef: string;
-  raw: RawBook;
+  requestStartedAtMs: number;
+  receivedAtMs: number;
+  requestCompletedAtMs: number;
+  transportAgeMs: number;
+  bookStateAgeMs: number | null;
+  rawRef: string | null;
+  raw: RawBook | null;
   normalized: ExecutableBook;
-  complete: boolean;
-  stale: boolean;
+  state: BookObservationState;
+  topologyState: BookTopologyState | null;
+  schemaValid: boolean;
+  transportFresh: boolean;
+  bookHash: string | null;
+  hashChange: BookHashChange;
+  timeSinceLastHashChangeMs: number | null;
+  pairRequestId: string;
 }
 
 export interface PairEconomics {
@@ -178,9 +236,19 @@ export interface PairEconomics {
   complete: boolean;
 }
 
-function emptyStats(): ShadowStats {
+export function emptyShadowStats(): ShadowStats {
   return {
     cycles: 0, marketFetchSuccess: 0, marketFetchFailure: 0, marketsSeen: 0,
+    marketsDiscovered: 0, metadataValidMarkets: 0, marketsSampled: 0,
+    bookPairRequests: 0, bookPairResponses: 0, bookResponsesObtained: 0,
+    schemaValidBooks: 0, transportFreshBooks: 0, transportStaleBooks: 0,
+    twoSidedBooks: 0, oneSidedBidOnlyBooks: 0, oneSidedAskOnlyBooks: 0,
+    emptyBooks: 0, missingBookResponses: 0, invalidBookResponses: 0,
+    requestFailedBooks: 0, hashInitial: 0, hashSame: 0, hashChanged: 0,
+    reliableBookPairs: 0, unreliableBookPairs: 0,
+    pairedStrategyEligible: 0, pairedStrategyIneligible: 0,
+    requiredExecutableSidesPairs: 0, enoughDepthPairs: 0, feeCoveredPairs: 0,
+    executableCandidateMarkets: 0, strategyRejectionReasons: {},
     booksAttempted: 0, completeBooks: 0, missingBooks: 0, staleBooks: 0,
     pairedBooksAvailable: 0, pairedBooksRejected: 0, pairedMarketsAvailable: 0,
     feeKnown: 0, feeDisabled: 0, feeUnknown: 0,
@@ -215,6 +283,11 @@ function manifestConfig(config: TrustedShadowConfig): RunManifest['config'] {
     latenciesMs: config.latenciesMs, fetchTimeoutMs: config.fetchTimeoutMs,
     preflightAttempts: config.preflightAttempts,
     preflightBackoffMs: config.preflightBackoffMs,
+    discoveryLimit: config.discoveryLimit,
+    minimumQualityMarkets: config.minimumQualityMarkets,
+    minimumQualityPairs: config.minimumQualityPairs,
+    minimumQualityCycles: config.minimumQualityCycles,
+    transportStaleAfterMs: config.transportStaleAfterMs,
   };
 }
 
@@ -249,6 +322,22 @@ function parseFeeContext(market: GammaMarket): PolymarketFeeContext {
     // Invalid metadata remains unknown and must fail closed.
   }
   return { feesEnabled, feeSchedule: null };
+}
+
+function validResearchMarket(market: GammaMarket): boolean {
+  const marketId = String(market.conditionId ?? market.condition_id ?? market.id ?? '');
+  const tokenIds = parseArray(market.clobTokenIds ?? market.token_ids);
+  const outcomes = parseArray(market.outcomes);
+  return Boolean(marketId) && tokenIds.length === 2 && outcomes.length === 2 &&
+    market.closed !== true && market.active !== false &&
+    market.enableOrderBook !== false && market.acceptingOrders !== false;
+}
+
+function researchMarketRank(market: GammaMarket): number {
+  const volume = Number(market.volume24hr ?? 0);
+  const liquidity = Number(market.liquidity ?? 0);
+  return (Number.isFinite(volume) ? volume : 0) * 1_000_000 +
+    (Number.isFinite(liquidity) ? liquidity : 0);
 }
 
 function normalizeLevels(levels: RawBook['bids'], descending: boolean): Array<[number, number]> {
@@ -315,47 +404,243 @@ function atomicWriteJson(path: string, value: unknown): void {
   renameSync(temp, path);
 }
 
-async function fetchJson<T>(url: string, timeoutMs: number): Promise<{ raw: T; startedAtMs: number; completedAtMs: number }> {
+interface FetchJsonResult<T> {
+  raw: T;
+  startedAtMs: number;
+  receivedAtMs: number;
+  completedAtMs: number;
+}
+
+async function fetchJson<T>(
+  url: string,
+  timeoutMs: number,
+  init: { method?: 'GET' | 'POST'; body?: string } = {},
+): Promise<FetchJsonResult<T>> {
   const parsed = new URL(url);
   if (!['gamma-api.polymarket.com', 'clob.polymarket.com'].includes(parsed.hostname)) {
     throw new Error(`UNAPPROVED_FEED_HOST: ${parsed.hostname}`);
   }
   const startedAtMs = Date.now();
   const response = await fetch(url, {
-    method: 'GET',
-    headers: { Accept: 'application/json', 'User-Agent': 'clodds-trusted-shadow-v1-paper-only' },
+    method: init.method ?? 'GET',
+    body: init.body,
+    headers: {
+      Accept: 'application/json',
+      ...(init.body ? { 'Content-Type': 'application/json' } : {}),
+      'User-Agent': 'clodds-trusted-shadow-v1-paper-only',
+    },
     signal: AbortSignal.timeout(timeoutMs),
   });
+  const receivedAtMs = Date.now();
   if (!response.ok) throw new Error(`HTTP_${response.status}: ${url}`);
   const raw = await response.json() as T;
-  return { raw, startedAtMs, completedAtMs: Date.now() };
+  return { raw, startedAtMs, receivedAtMs, completedAtMs: Date.now() };
 }
 
-async function fetchBook(tokenId: string, staleAfterMs: number, timeoutMs: number): Promise<BookObservation> {
-  const { raw, startedAtMs, completedAtMs } = await fetchJson<RawBook>(
-    `${CLOB_BOOK}?token_id=${encodeURIComponent(tokenId)}`,
-    timeoutMs,
-  );
+function validRawLevels(value: unknown): value is RawBook['bids'] {
+  return Array.isArray(value) && value.every((level) => {
+    if (typeof level !== 'object' || level === null) return false;
+    const rawLevel = level as { price?: unknown; size?: unknown };
+    const price = Number(rawLevel.price);
+    const size = Number(rawLevel.size);
+    return Number.isFinite(price) && price >= 0 && price <= 1 && Number.isFinite(size) && size > 0;
+  });
+}
+
+function topologyState(book: ExecutableBook): BookTopologyState {
+  if (book.bids.length > 0 && book.asks.length > 0) return 'TWO_SIDED';
+  if (book.bids.length > 0) return 'ONE_SIDED_BID_ONLY';
+  if (book.asks.length > 0) return 'ONE_SIDED_ASK_ONLY';
+  return 'EMPTY_BOOK';
+}
+
+export function makeBookObservation(params: {
+  tokenId: string;
+  raw: unknown;
+  requestStartedAtMs: number;
+  receivedAtMs: number;
+  requestCompletedAtMs: number;
+  pairRequestId: string;
+  transportStaleAfterMs: number;
+  absentState?: 'MISSING_BOOK' | 'REQUEST_FAILED';
+}): BookObservation {
+  const emptyBook: ExecutableBook = { bids: [], asks: [], timestamp: params.requestCompletedAtMs };
+  if (params.absentState) {
+    return {
+      tokenId: params.tokenId, sourceTimestampMs: null,
+      requestStartedAtMs: params.requestStartedAtMs, receivedAtMs: params.receivedAtMs,
+      requestCompletedAtMs: params.requestCompletedAtMs,
+      transportAgeMs: params.requestCompletedAtMs - params.requestStartedAtMs,
+      bookStateAgeMs: null, rawRef: null, raw: null, normalized: emptyBook,
+      state: params.absentState, topologyState: null, schemaValid: false,
+      transportFresh: false, bookHash: null, hashChange: 'UNAVAILABLE',
+      timeSinceLastHashChangeMs: null, pairRequestId: params.pairRequestId,
+    };
+  }
+  if (typeof params.raw !== 'object' || params.raw === null || Array.isArray(params.raw)) {
+    return {
+      tokenId: params.tokenId, sourceTimestampMs: null,
+      requestStartedAtMs: params.requestStartedAtMs, receivedAtMs: params.receivedAtMs,
+      requestCompletedAtMs: params.requestCompletedAtMs,
+      transportAgeMs: params.requestCompletedAtMs - params.requestStartedAtMs,
+      bookStateAgeMs: null, rawRef: hashJson(params.raw), raw: null, normalized: emptyBook,
+      state: 'INVALID_RESPONSE', topologyState: null, schemaValid: false,
+      transportFresh: false, bookHash: null, hashChange: 'UNAVAILABLE',
+      timeSinceLastHashChangeMs: null, pairRequestId: params.pairRequestId,
+    };
+  }
+  const raw = params.raw as RawBook;
   const rawTimestamp = raw.timestamp;
   const sourceTimestampMs = rawTimestamp === undefined || rawTimestamp === null || rawTimestamp === ''
     ? null
     : Number(rawTimestamp);
+  const schemaValid = String(raw.asset_id ?? '') === params.tokenId &&
+    Number.isFinite(sourceTimestampMs) && typeof raw.hash === 'string' && raw.hash.length > 0 &&
+    validRawLevels(raw.bids) && validRawLevels(raw.asks);
+  if (!schemaValid) {
+    return {
+      tokenId: params.tokenId,
+      sourceTimestampMs: Number.isFinite(sourceTimestampMs) ? sourceTimestampMs : null,
+      requestStartedAtMs: params.requestStartedAtMs, receivedAtMs: params.receivedAtMs,
+      requestCompletedAtMs: params.requestCompletedAtMs,
+      transportAgeMs: params.requestCompletedAtMs - params.requestStartedAtMs,
+      bookStateAgeMs: Number.isFinite(sourceTimestampMs)
+        ? params.requestCompletedAtMs - sourceTimestampMs! : null,
+      rawRef: hashJson(raw), raw, normalized: emptyBook,
+      state: 'INVALID_RESPONSE', topologyState: null, schemaValid: false,
+      transportFresh: false, bookHash: typeof raw.hash === 'string' ? raw.hash : null,
+      hashChange: 'UNAVAILABLE', timeSinceLastHashChangeMs: null,
+      pairRequestId: params.pairRequestId,
+    };
+  }
   const normalized: ExecutableBook = {
     bids: normalizeLevels(raw.bids, true),
     asks: normalizeLevels(raw.asks, false),
-    timestamp: Number.isFinite(sourceTimestampMs) ? sourceTimestampMs! : completedAtMs,
+    timestamp: sourceTimestampMs!,
   };
+  const transportAgeMs = params.requestCompletedAtMs - params.requestStartedAtMs;
+  const transportFresh = transportAgeMs <= params.transportStaleAfterMs;
+  const topology = topologyState(normalized);
   return {
-    tokenId,
-    sourceTimestampMs: Number.isFinite(sourceTimestampMs) ? sourceTimestampMs : null,
-    receiveStartedAtMs: startedAtMs,
-    receiveCompletedAtMs: completedAtMs,
+    tokenId: params.tokenId,
+    sourceTimestampMs: sourceTimestampMs!,
+    requestStartedAtMs: params.requestStartedAtMs,
+    receivedAtMs: params.receivedAtMs,
+    requestCompletedAtMs: params.requestCompletedAtMs,
+    transportAgeMs,
+    bookStateAgeMs: params.requestCompletedAtMs - sourceTimestampMs!,
     rawRef: hashJson(raw),
     raw,
     normalized,
-    complete: normalized.bids.length > 0 && normalized.asks.length > 0,
-    stale: sourceTimestampMs !== null && completedAtMs - sourceTimestampMs > staleAfterMs,
+    state: transportFresh ? topology : 'TRANSPORT_STALE',
+    topologyState: topology,
+    schemaValid: true,
+    transportFresh,
+    bookHash: raw.hash!, hashChange: 'UNAVAILABLE', timeSinceLastHashChangeMs: null,
+    pairRequestId: params.pairRequestId,
   };
+}
+
+export function applyBookHashTracking(
+  observation: BookObservation,
+  state: Record<string, { hash: string; lastChangedAtMs: number }>,
+): BookHashChange {
+  if (!observation.schemaValid || !observation.bookHash) return 'UNAVAILABLE';
+  const prior = state[observation.tokenId];
+  if (!prior) {
+    observation.hashChange = 'INITIAL';
+    observation.timeSinceLastHashChangeMs = 0;
+    state[observation.tokenId] = {
+      hash: observation.bookHash, lastChangedAtMs: observation.requestCompletedAtMs,
+    };
+  } else if (prior.hash === observation.bookHash) {
+    observation.hashChange = 'SAME';
+    observation.timeSinceLastHashChangeMs = observation.requestCompletedAtMs - prior.lastChangedAtMs;
+  } else {
+    observation.hashChange = 'CHANGED';
+    observation.timeSinceLastHashChangeMs = 0;
+    state[observation.tokenId] = {
+      hash: observation.bookHash, lastChangedAtMs: observation.requestCompletedAtMs,
+    };
+  }
+  return observation.hashChange;
+}
+
+interface PairedBookFetch {
+  pairRequestId: string;
+  requestStartedAtMs: number;
+  receivedAtMs: number;
+  requestCompletedAtMs: number;
+  rawBatchRef: string | null;
+  rawBooks: unknown;
+  observations: [BookObservation, BookObservation];
+  error: string | null;
+}
+
+async function fetchBookPair(
+  tokenIds: [string, string],
+  transportStaleAfterMs: number,
+  timeoutMs: number,
+): Promise<PairedBookFetch> {
+  const pairRequestId = randomUUID();
+  const fallbackStartedAtMs = Date.now();
+  try {
+    const response = await fetchJson<unknown>(CLOB_BOOKS, timeoutMs, {
+      method: 'POST', body: JSON.stringify(tokenIds.map((token_id) => ({ token_id }))),
+    });
+    const byAssetId = new Map<string, unknown>();
+    const rawArray = Array.isArray(response.raw) ? response.raw : null;
+    const batchSchemaValid = rawArray !== null;
+    if (rawArray) {
+      for (const value of rawArray) {
+        if (typeof value === 'object' && value !== null && !Array.isArray(value)) {
+          const assetId = String((value as RawBook).asset_id ?? '');
+          if (assetId) byAssetId.set(assetId, value);
+        }
+      }
+    }
+    const observations = tokenIds.map((tokenId) => makeBookObservation({
+      tokenId,
+      raw: batchSchemaValid ? (byAssetId.get(tokenId) ?? null) : response.raw,
+      requestStartedAtMs: response.startedAtMs,
+      receivedAtMs: response.receivedAtMs,
+      requestCompletedAtMs: response.completedAtMs,
+      pairRequestId,
+      transportStaleAfterMs,
+      absentState: batchSchemaValid && !byAssetId.has(tokenId) ? 'MISSING_BOOK' : undefined,
+    })) as [BookObservation, BookObservation];
+    return {
+      pairRequestId, requestStartedAtMs: response.startedAtMs,
+      receivedAtMs: response.receivedAtMs, requestCompletedAtMs: response.completedAtMs,
+      rawBatchRef: hashJson(response.raw), rawBooks: response.raw, observations, error: null,
+    };
+  } catch (error) {
+    const completedAtMs = Date.now();
+    const observations = tokenIds.map((tokenId) => makeBookObservation({
+      tokenId, raw: null, requestStartedAtMs: fallbackStartedAtMs,
+      receivedAtMs: completedAtMs, requestCompletedAtMs: completedAtMs,
+      pairRequestId, transportStaleAfterMs, absentState: 'REQUEST_FAILED',
+    })) as [BookObservation, BookObservation];
+    return {
+      pairRequestId, requestStartedAtMs: fallbackStartedAtMs,
+      receivedAtMs: completedAtMs, requestCompletedAtMs: completedAtMs,
+      rawBatchRef: null, rawBooks: null, observations, error: describeError(error),
+    };
+  }
+}
+
+async function fetchBook(
+  tokenId: string,
+  transportStaleAfterMs: number,
+  timeoutMs: number,
+): Promise<BookObservation> {
+  const pairRequestId = `single-${randomUUID()}`;
+  const response = await fetchJson<RawBook>(`${CLOB_BOOK}?token_id=${encodeURIComponent(tokenId)}`, timeoutMs);
+  return makeBookObservation({
+    tokenId, raw: response.raw, requestStartedAtMs: response.startedAtMs,
+    receivedAtMs: response.receivedAtMs, requestCompletedAtMs: response.completedAtMs,
+    pairRequestId, transportStaleAfterMs,
+  });
 }
 
 function bestAsk(book: ExecutableBook): number | null {
@@ -438,16 +723,29 @@ function rate(numerator: number, denominator: number): number | null {
   return denominator > 0 ? numerator / denominator : null;
 }
 
-function stopReasons(stats: ShadowStats): string[] {
+export function shadowStopReasons(stats: ShadowStats, config: TrustedShadowConfig): string[] {
   const reasons: string[] = [];
   if (stats.deniedPnlRecords > 0) reasons.push('DENIED_SOURCE_ENTERED_TRUSTED_LEDGER');
+  if (stats.marketFetchSuccess === 0) reasons.push('MARKET_FEED_UNAVAILABLE');
+  if (stats.bookPairRequests > 0 && stats.bookPairResponses === 0) {
+    reasons.push('CLOB_BOOK_FEED_UNAVAILABLE');
+  }
+  if (stats.bookPairResponses > 0 && stats.booksAttempted > 0 && stats.schemaValidBooks === 0) {
+    reasons.push('GLOBAL_BOOK_SCHEMA_INVALID');
+  }
+  const warmedUp = stats.cycles >= (config.minimumQualityCycles ?? 2) &&
+    stats.marketsSampled >= (config.minimumQualityMarkets ?? 20) &&
+    stats.bookPairRequests >= (config.minimumQualityPairs ?? 20);
+  if (!warmedUp) return reasons;
   const feeUnknownRate = rate(stats.feeUnknown, stats.feeKnown + stats.feeDisabled + stats.feeUnknown);
   if (feeUnknownRate !== null && feeUnknownRate > 0.25) reasons.push('FEE_UNKNOWN_RATE_MATERIAL');
-  const badBookRate = rate(stats.missingBooks + stats.staleBooks, stats.booksAttempted);
-  if (badBookRate !== null && badBookRate > 0.50) reasons.push('MISSING_OR_STALE_BOOKS_DOMINATE');
-  const pairRejectRate = rate(stats.pairedBooksRejected, stats.pairedMarketsAvailable + stats.pairedBooksRejected);
+  const badBookRate = rate(
+    stats.missingBookResponses + stats.invalidBookResponses + stats.requestFailedBooks + stats.transportStaleBooks,
+    stats.booksAttempted,
+  );
+  if (badBookRate !== null && badBookRate > 0.50) reasons.push('BOOK_DATA_FAILURES_DOMINATE');
+  const pairRejectRate = rate(stats.unreliableBookPairs, stats.bookPairRequests);
   if (pairRejectRate !== null && pairRejectRate > 0.20) reasons.push('BOOK_PAIRING_UNRELIABLE');
-  if (stats.marketFetchSuccess === 0) reasons.push('MARKET_FEED_UNAVAILABLE');
   return reasons;
 }
 
@@ -469,22 +767,30 @@ function writeReports(manifest: RunManifest, config: TrustedShadowConfig): void 
     `- Network preflight: ${JSON.stringify(manifest.networkPreflight ?? null)}\n` +
     `- Stop reasons: ${manifest.stopReasons.join(', ') || 'none'}\n`, 'utf8');
   writeFileSync(join(config.reportsDir, 'SHADOW_DATA_QUALITY.md'), `# Shadow Data Quality\n\n` + markdownTable([
-    ['cycles', s.cycles], ['markets seen', s.marketsSeen],
-    ['complete book rate', rate(s.completeBooks, s.booksAttempted)],
-    ['missing book rate', rate(s.missingBooks, s.booksAttempted)],
-    ['stale book rate', rate(s.staleBooks, s.booksAttempted)],
+    ['cycles', s.cycles], ['markets discovered', s.marketsDiscovered],
+    ['markets sampled', s.marketsSampled], ['REST pair responses', s.bookPairResponses],
+    ['two-sided books', s.twoSidedBooks], ['one-sided bid-only books', s.oneSidedBidOnlyBooks],
+    ['one-sided ask-only books', s.oneSidedAskOnlyBooks], ['empty books', s.emptyBooks],
+    ['missing books', s.missingBookResponses], ['invalid books', s.invalidBookResponses],
+    ['request-failed books', s.requestFailedBooks], ['transport-stale books', s.transportStaleBooks],
+    ['transport-fresh rate', rate(s.transportFreshBooks, s.schemaValidBooks)],
+    ['hash initial', s.hashInitial], ['hash same', s.hashSame], ['hash changed', s.hashChanged],
     ['fee known rate', rate(s.feeKnown, s.feeKnown + s.feeDisabled + s.feeUnknown)],
     ['fee disabled rate', rate(s.feeDisabled, s.feeKnown + s.feeDisabled + s.feeUnknown)],
     ['fee unknown rate', rate(s.feeUnknown, s.feeKnown + s.feeDisabled + s.feeUnknown)],
-    ['pair rejection rate', rate(s.pairedBooksRejected, s.pairedMarketsAvailable + s.pairedBooksRejected)],
+    ['unreliable pair rate', rate(s.unreliableBookPairs, s.bookPairRequests)],
     ['errors', s.errors],
-  ]) + `\n\nStop conditions: ${manifest.stopReasons.join(', ') || 'none'}.\n`, 'utf8');
-  writeFileSync(join(config.reportsDir, 'SHADOW_EDGE_FUNNEL.md'), `# Shadow Edge Funnel\n\n` + markdownTable([
-    ['detected candidate', s.detectedCandidate], ['paired books available', s.pairedBooksAvailable],
-    ['depth available', s.depthAvailable], ['fee known', s.feeKnownCandidate],
-    ['positive executable edge', s.positiveExecutableEdge], ['second leg available', s.secondLegAvailable],
-    ['complete fill', s.completeFill],
-  ]) + `\n\nUnit: market × requested-size × configured-latency scenario. Each row is conditional on all preceding rows.\n`, 'utf8');
+  ]) + `\n\nRatio warm-up: cycles >= ${config.minimumQualityCycles ?? 2}, sampled markets >= ${config.minimumQualityMarkets ?? 20}, book pairs >= ${config.minimumQualityPairs ?? 20}.\n\nStop conditions: ${manifest.stopReasons.join(', ') || 'none'}.\n`, 'utf8');
+  writeFileSync(join(config.reportsDir, 'SHADOW_EDGE_FUNNEL.md'), `# Shadow Edge Funnel\n\n## Data-quality funnel\n\n` + markdownTable([
+    ['market discovered', s.marketsDiscovered], ['metadata valid', s.metadataValidMarkets],
+    ['book response obtained', s.bookResponsesObtained], ['schema valid', s.schemaValidBooks],
+    ['transport fresh', s.transportFreshBooks],
+  ]) + `\n\n## Strategy-eligibility funnel\n\n` + markdownTable([
+    ['valid paired market data', s.reliableBookPairs],
+    ['required executable sides available', s.requiredExecutableSidesPairs],
+    ['enough depth', s.enoughDepthPairs], ['fee known', s.feeCoveredPairs],
+    ['executable candidate', s.executableCandidateMarkets],
+  ]) + `\n\nStrategy rejection reasons: ${JSON.stringify(s.strategyRejectionReasons)}.\n`, 'utf8');
   const sizeRows = Object.entries(s.sizeStress)
     .sort(([a], [b]) => Number(a) - Number(b))
     .map(([size, value]) => `| $${size} | ${value.evaluated} | ${value.positiveExecutableEdge} | ${value.completeFill} | ${value.partialSecondLeg} | ${value.zeroSecondLegLiquidity} | ${value.trustedPnlRecords} | ${value.trustedPnlSum} |`)
@@ -556,9 +862,13 @@ export class TrustedShadowV1Runner {
       this.manifest.processStartTime = now;
       this.manifest.stopReasons = [];
       this.manifest.config = manifestConfig(config);
-      this.manifest.stats.sizeStress ??= {};
-      this.manifest.stats.latencyStress ??= {};
-      this.manifest.stats.pairedMarketsAvailable ??= 0;
+      this.manifest.stats = {
+        ...emptyShadowStats(), ...this.manifest.stats,
+        sizeStress: this.manifest.stats.sizeStress ?? {},
+        latencyStress: this.manifest.stats.latencyStress ?? {},
+        strategyRejectionReasons: this.manifest.stats.strategyRejectionReasons ?? {},
+      };
+      this.manifest.bookHashState ??= {};
       this.manifest.processStarts.push({
         time: now, pid: process.pid, stage: config.stage, config: manifestConfig(config),
       });
@@ -585,8 +895,9 @@ export class TrustedShadowV1Runner {
         config: manifestConfig(config),
         lastSequence: 0,
         lastCompletedCycle: 0,
-        stats: emptyStats(),
+        stats: emptyShadowStats(),
         stopReasons: [],
+        bookHashState: {},
         recoveredIncompleteEventRanges: [],
         processStarts: [{
           time: now, pid: process.pid, stage: config.stage, config: manifestConfig(config),
@@ -617,12 +928,63 @@ export class TrustedShadowV1Runner {
     this.writer.append({
       eventType: 'book', runId: this.manifest.runId, commitSha: this.manifest.commitSha,
       processStartTime: this.manifest.processStartTime, marketId, tokenId: observation.tokenId,
-      sourceTimestampMs: observation.sourceTimestampMs,
-      localReceiveStartedAtMs: observation.receiveStartedAtMs,
-      localReceiveCompletedAtMs: observation.receiveCompletedAtMs,
+      pairRequestId: observation.pairRequestId,
+      receivedAtMs: observation.receivedAtMs,
+      requestStartedAtMs: observation.requestStartedAtMs,
+      requestCompletedAtMs: observation.requestCompletedAtMs,
+      exchangeBookTimestampMs: observation.sourceTimestampMs,
+      transportAgeMs: observation.transportAgeMs,
+      bookStateAgeMs: observation.bookStateAgeMs,
+      bookHash: observation.bookHash,
+      hashChange: observation.hashChange,
+      timeSinceLastHashChangeMs: observation.timeSinceLastHashChangeMs,
       rawBookRef: observation.rawRef, rawBook: observation.raw,
-      normalizedBook: observation.normalized, complete: observation.complete, stale: observation.stale,
+      normalizedBook: observation.normalized, state: observation.state,
+      topologyState: observation.topologyState, schemaValid: observation.schemaValid,
+      transportFresh: observation.transportFresh,
     });
+  }
+
+  private trackAndCountBook(observation: BookObservation): void {
+    const stats = this.manifest.stats;
+    stats.booksAttempted += 1;
+    if (observation.raw !== null) stats.bookResponsesObtained += 1;
+    if (observation.schemaValid) {
+      stats.schemaValidBooks += 1;
+      if (observation.transportFresh) stats.transportFreshBooks += 1;
+      else stats.transportStaleBooks += 1;
+    }
+    if (observation.topologyState === 'TWO_SIDED') {
+      stats.twoSidedBooks += 1;
+      stats.completeBooks += 1;
+    } else if (observation.topologyState === 'ONE_SIDED_BID_ONLY') {
+      stats.oneSidedBidOnlyBooks += 1;
+    } else if (observation.topologyState === 'ONE_SIDED_ASK_ONLY') {
+      stats.oneSidedAskOnlyBooks += 1;
+    } else if (observation.topologyState === 'EMPTY_BOOK') {
+      stats.emptyBooks += 1;
+    }
+    if (observation.state === 'MISSING_BOOK') {
+      stats.missingBookResponses += 1;
+      stats.missingBooks += 1;
+    } else if (observation.state === 'INVALID_RESPONSE') {
+      stats.invalidBookResponses += 1;
+      stats.missingBooks += 1;
+    } else if (observation.state === 'REQUEST_FAILED') {
+      stats.requestFailedBooks += 1;
+      stats.missingBooks += 1;
+    } else if (observation.state === 'TRANSPORT_STALE') {
+      stats.staleBooks += 1;
+    }
+    const hashChange = applyBookHashTracking(observation, this.manifest.bookHashState);
+    if (hashChange === 'INITIAL') stats.hashInitial += 1;
+    else if (hashChange === 'SAME') stats.hashSame += 1;
+    else if (hashChange === 'CHANGED') stats.hashChanged += 1;
+  }
+
+  private rejectStrategy(reason: string): void {
+    const reasons = this.manifest.stats.strategyRejectionReasons;
+    reasons[reason] = (reasons[reason] ?? 0) + 1;
   }
 
   private recordTrustedPnl(record: Record<string, unknown> & { pnl: number }): void {
@@ -636,19 +998,31 @@ export class TrustedShadowV1Runner {
   private async runCycle(): Promise<void> {
     const stats = this.manifest.stats;
     const timeoutMs = this.config.fetchTimeoutMs ?? 15_000;
+    const transportStaleAfterMs = this.config.transportStaleAfterMs ?? this.config.staleAfterMs;
     let markets: GammaMarket[];
     try {
+      const discoveryLimit = Math.max(this.config.discoveryLimit ?? 50, this.config.marketLimit);
       const query = new URLSearchParams({
-        active: 'true', closed: 'false', limit: String(this.config.marketLimit),
+        active: 'true', closed: 'false', limit: String(discoveryLimit),
         order: 'volume24hr', ascending: 'false',
       });
       const fetched = await fetchJson<GammaMarket[]>(`${GAMMA_MARKETS}?${query}`, timeoutMs);
       markets = Array.isArray(fetched.raw) ? fetched.raw : [];
       stats.marketFetchSuccess += 1;
+      stats.marketsDiscovered += markets.length;
+      const validMarkets = markets.filter(validResearchMarket)
+        .sort((a, b) => researchMarketRank(b) - researchMarketRank(a));
+      stats.metadataValidMarkets += validMarkets.length;
+      markets = validMarkets.slice(0, this.config.marketLimit);
+      stats.marketsSampled += markets.length;
       this.writer.append({
         eventType: 'market_batch', runId: this.manifest.runId, commitSha: this.manifest.commitSha,
         processStartTime: this.manifest.processStartTime,
-        localReceiveStartedAtMs: fetched.startedAtMs, localReceiveCompletedAtMs: fetched.completedAtMs,
+        requestStartedAtMs: fetched.startedAtMs, receivedAtMs: fetched.receivedAtMs,
+        requestCompletedAtMs: fetched.completedAtMs,
+        rawDiscoveryUniverseCount: Array.isArray(fetched.raw) ? fetched.raw.length : 0,
+        metadataValidCount: validMarkets.length, sampledCount: markets.length,
+        sampledMarketIds: markets.map((market) => String(market.conditionId ?? market.condition_id ?? market.id)),
         rawRef: hashJson(fetched.raw), rawMarkets: fetched.raw,
       });
     } catch (error) {
@@ -669,48 +1043,69 @@ export class TrustedShadowV1Runner {
       else if (feeContext.feeSchedule) stats.feeKnown += 1;
       else stats.feeUnknown += 1;
 
-      let yes: BookObservation;
-      let no: BookObservation;
-      try {
-        stats.booksAttempted += 2;
-        [yes, no] = await Promise.all([
-          fetchBook(tokenIds[0], this.config.staleAfterMs, timeoutMs),
-          fetchBook(tokenIds[1], this.config.staleAfterMs, timeoutMs),
-        ]);
-        for (const observation of [yes, no]) {
-          this.recordBook(marketId, observation);
-          if (!observation.complete) stats.missingBooks += 1;
-          else stats.completeBooks += 1;
-          if (observation.stale) stats.staleBooks += 1;
-        }
-      } catch (error) {
-        stats.missingBooks += 2;
-        stats.errors += 1;
-        this.writer.append({ eventType: 'error', scope: 'paired_books', marketId, tokenIds, error: describeError(error) });
-        continue;
+      stats.bookPairRequests += 1;
+      const pair = await fetchBookPair(
+        [tokenIds[0], tokenIds[1]], transportStaleAfterMs, timeoutMs,
+      );
+      if (pair.error === null) stats.bookPairResponses += 1;
+      else stats.errors += 1;
+      const [yes, no] = pair.observations;
+      for (const observation of [yes, no]) {
+        this.trackAndCountBook(observation);
+        this.recordBook(marketId, observation);
       }
+      this.writer.append({
+        eventType: 'book_pair', runId: this.manifest.runId, commitSha: this.manifest.commitSha,
+        processStartTime: this.manifest.processStartTime, marketId, tokenIds,
+        pairRequestId: pair.pairRequestId, requestStartedAtMs: pair.requestStartedAtMs,
+        receivedAtMs: pair.receivedAtMs, requestCompletedAtMs: pair.requestCompletedAtMs,
+        rawBatchRef: pair.rawBatchRef, rawBooks: pair.rawBooks, error: pair.error,
+        yes: { timestampMs: yes.sourceTimestampMs, hash: yes.bookHash, state: yes.state, topology: yes.topologyState },
+        no: { timestampMs: no.sourceTimestampMs, hash: no.bookHash, state: no.state, topology: no.topologyState },
+      });
 
       const sizes = this.config.sizesUsd ?? SHADOW_V1_SIZES_USD;
       const latencies = [...(this.config.latenciesMs ?? SHADOW_V1_LATENCIES_MS)].sort((a, b) => a - b);
-      const candidate = yes.complete && no.complete && !yes.stale && !no.stale &&
-        (bestAsk(yes.normalized) ?? 1) + (bestAsk(no.normalized) ?? 1) < 1;
       const scenarioCount = sizes.length * latencies.length;
-      if (candidate) stats.detectedCandidate += scenarioCount;
       const sourceGap = yes.sourceTimestampMs === null || no.sourceTimestampMs === null
         ? Number.POSITIVE_INFINITY
         : Math.abs(yes.sourceTimestampMs - no.sourceTimestampMs);
-      const paired = yes.complete && no.complete && !yes.stale && !no.stale && sourceGap <= this.config.maxPairGapMs;
-      if (!paired) {
+      const pairReliable = yes.schemaValid && no.schemaValid && yes.transportFresh && no.transportFresh;
+      if (!pairReliable) {
+        stats.unreliableBookPairs += 1;
         stats.pairedBooksRejected += 1;
+        stats.pairedStrategyIneligible += 1;
+        const rejection = pair.error ? 'REQUEST_FAILED'
+          : [yes, no].some((value) => value.state === 'INVALID_RESPONSE') ? 'INVALID_RESPONSE'
+            : [yes, no].some((value) => value.state === 'MISSING_BOOK') ? 'MISSING_BOOK'
+              : 'TRANSPORT_STALE';
+        this.rejectStrategy(rejection);
         this.writer.append({
-          eventType: 'pair_rejected', marketId, tokenIds, sourceGapMs: sourceGap,
+          eventType: 'strategy_rejected', marketId, tokenIds, sourceGapMs: sourceGap,
+          pairRequestId: pair.pairRequestId,
           yesRawRef: yes.rawRef, noRawRef: no.rawRef,
-          reason: !yes.complete || !no.complete ? 'MISSING_BOOK' : yes.stale || no.stale ? 'STALE_BOOK' : 'PAIR_GAP',
+          reason: rejection, dataQualityEligible: false,
         });
         continue;
       }
+      stats.reliableBookPairs += 1;
       stats.pairedMarketsAvailable += 1;
-      if (candidate) stats.pairedBooksAvailable += scenarioCount;
+      const yesExecutable = yes.normalized.asks.length > 0;
+      const noExecutable = no.normalized.asks.length > 0;
+      if (!yesExecutable || !noExecutable) {
+        stats.pairedStrategyIneligible += 1;
+        const rejection = !yesExecutable && !noExecutable ? 'BOTH_BUY_SIDES_UNAVAILABLE'
+          : !yesExecutable ? 'YES_BUY_SIDE_UNAVAILABLE' : 'NO_BUY_SIDE_UNAVAILABLE';
+        this.rejectStrategy(rejection);
+        this.writer.append({
+          eventType: 'strategy_rejected', marketId, tokenIds, pairRequestId: pair.pairRequestId,
+          reason: rejection, dataQualityEligible: true,
+          topology: { yes: yes.topologyState, no: no.topologyState },
+        });
+        continue;
+      }
+      stats.pairedBooksAvailable += scenarioCount;
+      stats.requiredExecutableSidesPairs += 1;
       const evaluated: PairEconomics[] = [];
       for (const capitalUsd of sizes) {
         const economics = evaluatePairAtSize({
@@ -723,11 +1118,12 @@ export class TrustedShadowV1Runner {
         for (const latencyMs of latencies) {
           stressBucket(stats.latencyStress, latencyMs).evaluated += 1;
         }
-        if (candidate && economics.complete) stats.depthAvailable += latencies.length;
-        if (candidate && economics.complete && economics.feeStatus === 'KNOWN') {
+        if (economics.complete) stats.depthAvailable += latencies.length;
+        if (economics.complete && economics.feeStatus === 'KNOWN') {
           stats.feeKnownCandidate += latencies.length;
         }
-        if (candidate && economics.complete && economics.feeStatus === 'KNOWN' && economics.positiveExecutableEdge) {
+        if (economics.complete && economics.feeStatus === 'KNOWN' && economics.positiveExecutableEdge) {
+          stats.detectedCandidate += latencies.length;
           stats.positiveExecutableEdge += latencies.length;
           sizeStats.positiveExecutableEdge += latencies.length;
           for (const latencyMs of latencies) {
@@ -739,7 +1135,7 @@ export class TrustedShadowV1Runner {
           source: SHADOW_V1_OPPORTUNITY_SOURCE, runId: this.manifest.runId,
           commitSha: this.manifest.commitSha, processStartTime: this.manifest.processStartTime,
           marketId, tokenIds, sourceTimestampsMs: [yes.sourceTimestampMs, no.sourceTimestampMs],
-          localReceiveTimestampsMs: [yes.receiveCompletedAtMs, no.receiveCompletedAtMs],
+          localReceiveTimestampsMs: [yes.requestCompletedAtMs, no.requestCompletedAtMs],
           rawBookRefs: [yes.rawRef, no.rawRef], feeMetadata: feeContext,
           feeStatus: economics.feeStatus, strategy: 'complete-set-executable-economics',
           requestedSizeUsd: capitalUsd, requestedShares: economics.requestedShares,
@@ -753,29 +1149,51 @@ export class TrustedShadowV1Runner {
             latencyDecay: 0, legRiskImpact: 0, trustedShadowPnl: economics.executablePnl,
           },
           funnel: {
-            detectedCandidate: candidate, pairedBooksAvailable: true,
+            validMarketData: true, requiredExecutableSidesAvailable: true,
             depthAvailable: economics.complete,
-            feeKnown: economics.feeStatus === 'KNOWN', positiveExecutableEdge: economics.positiveExecutableEdge,
+            feeKnown: economics.feeStatus === 'KNOWN', executableCandidate: economics.positiveExecutableEdge,
           },
         });
       }
 
+      const enoughDepth = evaluated.some((value) => value.complete && value.requestedShares > 0);
+      const feeCovered = evaluated.some((value) => value.feeStatus === 'KNOWN');
+      if (enoughDepth) stats.enoughDepthPairs += 1;
+      if (enoughDepth && feeCovered) stats.feeCoveredPairs += 1;
+      if (!enoughDepth || !feeCovered) {
+        stats.pairedStrategyIneligible += 1;
+        const rejection = enoughDepth ? 'FEE_UNKNOWN' : 'INSUFFICIENT_EXECUTABLE_DEPTH';
+        this.rejectStrategy(rejection);
+        this.writer.append({
+          eventType: 'strategy_rejected', marketId, tokenIds, pairRequestId: pair.pairRequestId,
+          reason: rejection, dataQualityEligible: true,
+        });
+        continue;
+      }
+      stats.pairedStrategyEligible += 1;
       const viable = evaluated.filter((value) => value.positiveExecutableEdge);
-      if (viable.length === 0) continue;
+      if (viable.length === 0) {
+        this.rejectStrategy('NO_POSITIVE_EXECUTABLE_EDGE');
+        this.writer.append({
+          eventType: 'strategy_rejected', marketId, tokenIds, pairRequestId: pair.pairRequestId,
+          reason: 'NO_POSITIVE_EXECUTABLE_EDGE', dataQualityEligible: true,
+        });
+        continue;
+      }
+      stats.executableCandidateMarkets += 1;
       const detectedAtMs = Date.now();
       const laterNoBooks = new Map<number, BookObservation>();
       for (const latencyMs of latencies) {
         const waitMs = detectedAtMs + latencyMs - Date.now();
         if (waitMs > 0) await new Promise((resolveWait) => setTimeout(resolveWait, waitMs));
         try {
-          stats.booksAttempted += 1;
-          const observed = await fetchBook(tokenIds[1], this.config.staleAfterMs, timeoutMs);
+          const observed = await fetchBook(tokenIds[1], transportStaleAfterMs, timeoutMs);
+          this.trackAndCountBook(observed);
           this.recordBook(marketId, observed);
           laterNoBooks.set(latencyMs, observed);
-          if (!observed.complete) stats.missingBooks += 1;
-          else stats.completeBooks += 1;
-          if (observed.stale) stats.staleBooks += 1;
         } catch (error) {
+          stats.booksAttempted += 1;
+          stats.requestFailedBooks += 1;
           stats.missingBooks += 1;
           stats.errors += 1;
           this.writer.append({ eventType: 'error', scope: 'second_leg', marketId, latencyMs, error: describeError(error) });
@@ -785,7 +1203,7 @@ export class TrustedShadowV1Runner {
       for (const economics of viable) {
         for (const latencyMs of latencies) {
           const laterNo = laterNoBooks.get(latencyMs);
-          if (!laterNo || laterNo.stale) continue;
+          if (!laterNo || !laterNo.schemaValid || !laterNo.transportFresh || laterNo.normalized.asks.length === 0) continue;
           const sizeStats = stressBucket(stats.sizeStress, economics.capitalUsd);
           const latencyStats = stressBucket(stats.latencyStress, latencyMs);
           const secondLegHasDepth = laterNo.normalized.asks.length > 0;
@@ -829,13 +1247,13 @@ export class TrustedShadowV1Runner {
             runId: this.manifest.runId, commitSha: this.manifest.commitSha,
             processStartTime: this.manifest.processStartTime, marketId, tokenIds,
             sourceTimestampsMs: [yes.sourceTimestampMs, laterNo.sourceTimestampMs],
-            localReceiveTimestampsMs: [yes.receiveCompletedAtMs, laterNo.receiveCompletedAtMs],
+            localReceiveTimestampsMs: [yes.requestCompletedAtMs, laterNo.requestCompletedAtMs],
             rawBookRefs: [yes.rawRef, laterNo.rawRef], feeMetadata: feeContext,
             feeStatus: result.fees === null ? FEE_UNKNOWN : 'KNOWN',
             strategy: 'complete-set-executable-economics', requestedSizeUsd: economics.capitalUsd,
             requestedShares: economics.requestedShares, actualSimulatedFill: result.executions,
             vwap: result.executions.map((execution) => execution.fill.vwap),
-            configuredLatencyMs: latencyMs, observedDelayMs: laterNo.receiveCompletedAtMs - detectedAtMs,
+            configuredLatencyMs: latencyMs, observedDelayMs: laterNo.requestCompletedAtMs - detectedAtMs,
             matchedQuantity: result.matchedQuantity, unhedgedQuantity: result.unhedgedSize,
             pnlAttribution: {
               theoreticalEdge: economics.theoreticalEdge, depthImpact: economics.depthImpact,
@@ -887,7 +1305,7 @@ export class TrustedShadowV1Runner {
         this.manifest.stats.cycles += 1;
         this.manifest.lastCompletedCycle += 1;
         this.syncSequence();
-        const reasons = stopReasons(this.manifest.stats);
+        const reasons = shadowStopReasons(this.manifest.stats, this.config);
         if (reasons.length > 0) {
           this.manifest.stopReasons = reasons;
           this.manifest.status = 'blocked';
