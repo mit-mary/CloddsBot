@@ -11,6 +11,7 @@
     "build": "tsc && node -e \"const{cpSync,readdirSync}=require('fs'),p=require('path');readdirSync('src/skills/bundled',{withFileTypes:true}).filter(d=>d.isDirectory()).forEach(d=>{const s=p.join('src/skills/bundled',d.name,'SKILL.md'),t=p.join('dist/skills/bundled',d.name,'SKILL.md');try{cpSync(s,t)}catch{}})\"",
     "start": "node dist/index.js",
     "gateway": "tsx src/gateway/index.ts",
+    "shadow-observer": "tsx src/gateway/shadow-observer-cli.ts",
     "worker": "tsx src/bin/worker.ts",
     "onboard": "tsx src/cli/onboard.ts",
     "typecheck": "tsc --noEmit",
