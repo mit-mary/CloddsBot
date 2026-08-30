@@ -92,7 +92,7 @@ function fixture(): { root: string; runDir: string; eventsPath: string } {
   return { root, runDir, eventsPath };
 }
 
-describe('Shadow Observer V1', () => {
+describe('Shadow Observer V2', () => {
   it('reads manifest counters and recorded economics without alternate recomputation', () => {
     const f = fixture();
     try {
@@ -108,11 +108,21 @@ describe('Shadow Observer V1', () => {
       assert.equal(snapshot.markets[0].rawSum, 0.99);
       assert.equal(snapshot.markets[0].edge10Bps, -20);
       assert.equal(snapshot.markets[0].edge100Bps, -30);
+      assert.equal(snapshot.markets[0].bestEdgeBps, -20);
+      assert.equal(snapshot.markets[0].edgeTrend.length, 1);
       assert.equal(snapshot.nearMiss.buckets['-10 to -25 bps'], 1);
       assert.equal(snapshot.nearMiss.buckets['-25 to -50 bps'], 1);
+      assert.equal(snapshot.analytics.reference, '$100 recorded executable economics at 0ms');
+      assert.equal(snapshot.analytics.edgeTimeSeries.length, 1);
+      assert.equal(snapshot.analytics.edgeTimeSeries[0].medianBps, -30);
+      assert.equal(snapshot.analytics.edgeHistogram.total, 1);
+      assert.equal(snapshot.system.run.runId, 'run-1');
+      assert.equal(snapshot.system.safety.guards.NO_LIVE_TRADING, 'true');
       const detail = reader.marketDetail(MARKET_ID) as any;
       assert.equal(detail.sizeLadder[0].finalExecutablePnlUsd, -0.02);
       assert.equal(detail.sizeLadder[0].feeImpactUsd, 0.01);
+      assert.equal(detail.edgeTimeline.length, 1);
+      assert.equal(detail.activity.hashActivity.INITIAL, 2);
       assert.match(detail.note, /does not infer maker fills/);
     } finally {
       rmSync(f.root, { recursive: true, force: true });
@@ -161,8 +171,15 @@ describe('Shadow Observer V1', () => {
       assert.match(html, /PAPER ONLY/);
       assert.match(html, /NO WALLET/);
       assert.match(html, /NO LIVE TRADING/);
-      assert.match(html, /Strongest recent non-positive observations/);
-      assert.match(html, /Recent recorded observations/);
+      assert.match(html, /Market research pulse/);
+      assert.match(html, /Executable edge over time/);
+      assert.match(html, /Overview/);
+      assert.match(html, /Markets/);
+      assert.match(html, /Analytics/);
+      assert.match(html, /System/);
+      assert.match(html, /Current opportunities \/ near misses/);
+      assert.match(html, /Market activity/);
+      assert.match(html, /cdn\.jsdelivr\.net\/npm\/chart\.js/);
       assert.doesNotMatch(html, /<button|<form|place order|enable strategy|restart shadow/i);
 
       const snapshot = await fetch(`${address.url}/api/snapshot`);

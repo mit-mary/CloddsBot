@@ -20,7 +20,7 @@ async function main(): Promise<void> {
   });
   const address = await observer.start();
   process.stdout.write(`${JSON.stringify({
-    service: 'shadow-observer-v1',
+    service: 'shadow-observer-v2',
     readOnly: true,
     runDir: observer.reader.runDir,
     ...address,

@@ -1,5 +1,5 @@
 /**
- * Shadow Observer V1
+ * Shadow Observer V2
  *
  * Read-only views over an existing trusted-shadow run. This module never writes
  * to the run directory and never imports wallet, execution, or strategy control
@@ -11,6 +11,7 @@ import express, { type Express, type Request, type Response } from 'express';
 import { closeSync, existsSync, openSync, readFileSync, readSync, statSync } from 'node:fs';
 import { createServer as createHttpServer, type Server } from 'node:http';
 import { resolve, join } from 'node:path';
+import { shadowObserverHtml } from './shadow-observer-ui.js';
 
 type JsonRecord = Record<string, unknown>;
 
@@ -38,6 +39,17 @@ interface Manifest {
   stats: JsonRecord;
   stopReasons: string[];
   recoveredIncompleteEventRanges?: unknown[];
+  networkPreflight?: JsonRecord;
+  processStarts?: JsonRecord[];
+}
+
+interface EdgeObservation {
+  sequence: number;
+  at: string | null;
+  requestedSizeUsd: number;
+  latencyMs: number;
+  netEdgeBps: number;
+  pnlUsd: number;
 }
 
 interface MarketViewState {
@@ -51,6 +63,10 @@ interface MarketViewState {
   rejectionReason: string | null;
   latestUpdateMs: number | null;
   recent: Array<{ sequence: number; eventType: string; summary: string; at: string | null }>;
+  edgeHistory: EdgeObservation[];
+  hashActivity: Record<'INITIAL' | 'SAME' | 'CHANGED', number>;
+  topologyChanges: number;
+  lastTopologyByToken: Map<string, string>;
 }
 
 interface PairWindowState {
@@ -129,6 +145,16 @@ function distribution(values: number[]): JsonRecord {
     p99: percentile(values, 0.99),
     max: percentile(values, 1),
   };
+}
+
+function histogram(values: number[], boundaries: number[], labels: string[]): JsonRecord {
+  const counts = labels.map(() => 0);
+  for (const value of values) {
+    let index = boundaries.findIndex((boundary) => value < boundary);
+    if (index < 0) index = labels.length - 1;
+    counts[index] += 1;
+  }
+  return { labels, counts, total: values.length };
 }
 
 function eventTimeMs(event: JsonRecord): number | null {
@@ -255,6 +281,7 @@ export class ShadowRunReader {
   private lastEventTimeMs: number | null = null;
   private markets = new Map<string, MarketViewState>();
   private metadata = new Map<string, JsonRecord>();
+  private latestSampledMarketIds = new Set<string>();
   private pairs = new Map<string, PairWindowState>();
   private latestPairByMarket = new Map<string, string>();
   private transportAges: number[] = [];
@@ -301,6 +328,10 @@ export class ShadowRunReader {
         rejectionReason: null,
         latestUpdateMs: null,
         recent: [],
+        edgeHistory: [],
+        hashActivity: { INITIAL: 0, SAME: 0, CHANGED: 0 },
+        topologyChanges: 0,
+        lastTopologyByToken: new Map(),
       };
       this.markets.set(marketId, value);
     }
@@ -334,6 +365,8 @@ export class ShadowRunReader {
     const type = string(event.eventType);
 
     if (type === 'market_batch') {
+      const sampledMarketIds = array(event.sampledMarketIds).map((item) => string(item)).filter(Boolean);
+      if (sampledMarketIds.length > 0) this.latestSampledMarketIds = new Set(sampledMarketIds);
       for (const item of array(event.rawMarkets)) {
         const parsed = record(item);
         const id = marketIdOf(parsed);
@@ -352,6 +385,14 @@ export class ShadowRunReader {
       const market = this.market(marketId);
       if (type === 'book') {
         const tokenId = string(event.tokenId);
+        const topology = string(event.topologyState ?? event.state, 'UNKNOWN');
+        const previousTopology = market.lastTopologyByToken.get(tokenId);
+        if (previousTopology && previousTopology !== topology) market.topologyChanges += 1;
+        if (tokenId) market.lastTopologyByToken.set(tokenId, topology);
+        const hashChange = string(event.hashChange);
+        if (hashChange === 'INITIAL' || hashChange === 'SAME' || hashChange === 'CHANGED') {
+          market.hashActivity[hashChange] += 1;
+        }
         if (tokenId) market.books.set(tokenId, event);
         const transportAge = nullableNumber(event.transportAgeMs);
         const stateAge = nullableNumber(event.bookStateAgeMs);
@@ -403,16 +444,26 @@ export class ShadowRunReader {
         }
         const edge = netEdge(event);
         if (edge) {
-          this.nearMisses.push({
+          const observation: EdgeObservation = {
             sequence: number(event.sequence),
-            marketId,
-            question: marketQuestion(market.metadata, marketId),
+            at: iso(time),
             requestedSizeUsd: number(event.requestedSizeUsd),
             latencyMs: number(event.latencyMs),
             netEdgeBps: edge.bps,
             pnlUsd: edge.pnlUsd,
+          };
+          market.edgeHistory.push(observation);
+          if (market.edgeHistory.length > 1_024) market.edgeHistory.splice(0, market.edgeHistory.length - 1_024);
+          this.nearMisses.push({
+            sequence: observation.sequence,
+            marketId,
+            question: marketQuestion(market.metadata, marketId),
+            requestedSizeUsd: observation.requestedSizeUsd,
+            latencyMs: observation.latencyMs,
+            netEdgeBps: observation.netEdgeBps,
+            pnlUsd: observation.pnlUsd,
             feeStatus: string(event.feeStatus),
-            at: iso(time),
+            at: observation.at,
           });
           if (this.nearMisses.length > this.maxSamples) {
             this.nearMisses.splice(0, this.nearMisses.length - this.maxSamples);
@@ -502,11 +553,16 @@ export class ShadowRunReader {
     const noAsk = bestLevel(no, 'asks');
     const econ10 = market.economics.get('10:0');
     const econ100 = market.economics.get('100:0');
+    const econ500 = market.economics.get('500:0');
     const fill10 = econ10 ? record(econ10.actualSimulatedFill) : {};
     const yesFill = record(fill10.yes);
     const noFill = record(fill10.no);
     const yesState = string(yes?.state, 'UNKNOWN');
     const noState = string(no?.state, 'UNKNOWN');
+    const currentEdges = SIZE_LADDER.map((size) => {
+      const event = market.economics.get(`${size}:0`);
+      return event ? netEdge(event)?.bps ?? null : null;
+    }).filter((value): value is number => value !== null);
     return {
       marketId: market.marketId,
       question: marketQuestion(market.metadata, market.marketId),
@@ -517,6 +573,8 @@ export class ShadowRunReader {
       rawSum: yesAsk !== null && noAsk !== null ? yesAsk + noAsk : null,
       edge10Bps: econ10 ? netEdge(econ10)?.bps ?? null : null,
       edge100Bps: econ100 ? netEdge(econ100)?.bps ?? null : null,
+      edge500Bps: econ500 ? netEdge(econ500)?.bps ?? null : null,
+      bestEdgeBps: currentEdges.length > 0 ? Math.max(...currentEdges) : null,
       availableDepthShares: Math.min(
         nullableNumber(yesFill.availableCapacity) ?? Number.POSITIVE_INFINITY,
         nullableNumber(noFill.availableCapacity) ?? Number.POSITIVE_INFINITY,
@@ -526,6 +584,98 @@ export class ShadowRunReader {
       lastHashChangeMs: Math.max(nullableNumber(yes?.timeSinceLastHashChangeMs) ?? 0, nullableNumber(no?.timeSinceLastHashChangeMs) ?? 0) || 0,
       latestUpdate: iso(market.latestUpdateMs),
       rejectionReason: market.rejectionReason,
+      edgeTrend: market.edgeHistory
+        .filter((item) => item.requestedSizeUsd === 100 && item.latencyMs === 0)
+        .slice(-24)
+        .map((item) => ({ at: item.at, bps: item.netEdgeBps })),
+    };
+  }
+
+  private analytics(markets: JsonRecord[]): JsonRecord {
+    const reference = this.nearMisses.filter((item) => item.requestedSizeUsd === 100 && item.latencyMs === 0);
+    const byMinute = new Map<number, number[]>();
+    for (const item of reference) {
+      if (!item.at) continue;
+      const timestamp = Date.parse(item.at);
+      if (!Number.isFinite(timestamp)) continue;
+      const bucket = Math.floor(timestamp / 60_000) * 60_000;
+      const values = byMinute.get(bucket) ?? [];
+      values.push(item.netEdgeBps);
+      byMinute.set(bucket, values);
+    }
+    const edgeTimeSeries = [...byMinute.entries()].sort((a, b) => a[0] - b[0]).map(([at, values]) => ({
+      at: new Date(at).toISOString(),
+      count: values.length,
+      bestBps: percentile(values, 1),
+      medianBps: percentile(values, 0.5),
+      p25Bps: percentile(values, 0.25),
+      p75Bps: percentile(values, 0.75),
+    }));
+    const edgeValues = reference.map((item) => item.netEdgeBps);
+    const edgeHistogram = histogram(
+      edgeValues,
+      [-500, -250, -100, -50, -25, -10, 0, 10, 25, 50, 100],
+      ['< -500', '-500 to -250', '-250 to -100', '-100 to -50', '-50 to -25', '-25 to -10', '-10 to 0', '0 to 10', '10 to 25', '25 to 50', '50 to 100', '> 100'],
+    );
+    const sizeProfile = SIZE_LADDER.map((size) => {
+      const values = this.nearMisses
+        .filter((item) => item.requestedSizeUsd === size && item.latencyMs === 0)
+        .map((item) => item.netEdgeBps);
+      return { size, count: values.length, bestBps: percentile(values, 1), medianBps: percentile(values, 0.5) };
+    });
+    const categories = new Map<string, number[]>();
+    for (const item of reference) {
+      const category = this.markets.get(item.marketId)?.category ?? 'other';
+      const values = categories.get(category) ?? [];
+      values.push(item.netEdgeBps);
+      categories.set(category, values);
+    }
+    const categoryComparison = [...categories.entries()].map(([category, values]) => ({
+      category,
+      count: values.length,
+      bestBps: percentile(values, 1),
+      medianBps: percentile(values, 0.5),
+    })).sort((a, b) => number(b.bestBps, Number.NEGATIVE_INFINITY) - number(a.bestBps, Number.NEGATIVE_INFINITY));
+    const topologyCounts = new Map<string, number>();
+    for (const market of markets) {
+      const topology = string(market.topology, 'UNKNOWN');
+      topologyCounts.set(topology, (topologyCounts.get(topology) ?? 0) + 1);
+    }
+    const latencySurvival = [0, 100, 250, 500, 1_000, 2_000, 3_000, 5_000].map((latencyMs) => {
+      const values = this.nearMisses
+        .filter((item) => item.requestedSizeUsd === 100 && item.latencyMs === latencyMs)
+        .map((item) => item.netEdgeBps);
+      return {
+        latencyMs,
+        count: values.length,
+        positive: values.filter((value) => value > 0).length,
+        bestBps: percentile(values, 1),
+        medianBps: percentile(values, 0.5),
+      };
+    }).filter((item) => item.count > 0);
+    return {
+      reference: '$100 recorded executable economics at 0ms',
+      window: {
+        firstAt: reference.find((item) => item.at)?.at ?? null,
+        lastAt: [...reference].reverse().find((item) => item.at)?.at ?? null,
+        observations: reference.length,
+      },
+      edgeTimeSeries,
+      edgeHistogram,
+      sizeProfile,
+      categoryComparison,
+      topologyDistribution: [...topologyCounts.entries()].map(([topology, count]) => ({ topology, count })),
+      bookStateAgeHistogram: histogram(
+        this.bookStateAges,
+        [1_000, 5_000, 15_000, 60_000, 300_000],
+        ['< 1s', '1–5s', '5–15s', '15–60s', '1–5m', '> 5m'],
+      ),
+      hashChangeAgeHistogram: histogram(
+        this.hashChangeAges,
+        [1_000, 5_000, 15_000, 60_000, 300_000],
+        ['< 1s', '1–5s', '5–15s', '15–60s', '1–5m', '> 5m'],
+      ),
+      latencySurvival,
     };
   }
 
@@ -608,7 +758,8 @@ export class ShadowRunReader {
     const createdAtMs = Date.parse(manifest.createdAt);
     const targetDurationSeconds = number(manifest.config.durationSeconds);
     const marketList = [...this.markets.values()]
-      .filter((item) => item.tokenIds.length === 2)
+      .filter((item) => item.tokenIds.length === 2
+        && (this.latestSampledMarketIds.size === 0 || this.latestSampledMarketIds.has(item.marketId)))
       .map((item) => this.marketSummary(item));
     return {
       generatedAt: new Date().toISOString(),
@@ -628,6 +779,7 @@ export class ShadowRunReader {
         targetDurationSeconds,
         cycles: number(stats.cycles),
         marketsSampled: number(stats.marketsSampled),
+        currentSampledMarkets: marketList.length,
         pairedRequests: pairRequests,
         pairReliability: rate(number(stats.reliableBookPairs), pairRequests),
         feeUnknownRate: rate(number(stats.feeUnknown), feeTotal),
@@ -641,6 +793,7 @@ export class ShadowRunReader {
       funnel: this.funnel(),
       nearMiss: this.nearMissDistribution(),
       markets: marketList,
+      analytics: this.analytics(marketList),
       dataQuality: {
         cumulative: {
           TWO_SIDED: number(stats.twoSidedBooks),
@@ -667,6 +820,27 @@ export class ShadowRunReader {
         },
       },
       events: this.recentImportantEvents(),
+      system: {
+        run: {
+          runId: manifest.runId,
+          commitSha: manifest.commitSha,
+          branch: string(manifest.config.branch) || null,
+          stage: manifest.stage,
+          createdAt: manifest.createdAt,
+          processStartTime: manifest.processStartTime,
+          status: manifest.status,
+          recorderSequence: manifest.lastSequence,
+          completedCycle: manifest.lastCompletedCycle,
+        },
+        networkPreflight: manifest.networkPreflight ?? null,
+        safety: {
+          guards: manifest.guards,
+          trustedPnlSources: manifest.trustedPnlSources,
+          deniedCapabilities: manifest.deniedCapabilities,
+          trustedPnlRecords: number(stats.trustedPnlRecords),
+          deniedPnlRecords: number(stats.deniedPnlRecords),
+        },
+      },
       diagnostics: this.diagnostics(),
     };
   }
@@ -738,6 +912,9 @@ export class ShadowRunReader {
           receivedAtMs: yes?.receivedAtMs ?? null,
           hash: yes?.bookHash ?? null,
           hashChange: yes?.hashChange ?? null,
+          transportAgeMs: yes?.transportAgeMs ?? null,
+          bookStateAgeMs: yes?.bookStateAgeMs ?? null,
+          timeSinceLastHashChangeMs: yes?.timeSinceLastHashChangeMs ?? null,
         },
         no: {
           tokenId: noToken ?? null,
@@ -750,9 +927,19 @@ export class ShadowRunReader {
           receivedAtMs: no?.receivedAtMs ?? null,
           hash: no?.bookHash ?? null,
           hashChange: no?.hashChange ?? null,
+          transportAgeMs: no?.transportAgeMs ?? null,
+          bookStateAgeMs: no?.bookStateAgeMs ?? null,
+          timeSinceLastHashChangeMs: no?.timeSinceLastHashChangeMs ?? null,
         },
       },
       sizeLadder: ladder,
+      edgeTimeline: market.edgeHistory
+        .filter((item) => item.requestedSizeUsd === 100 && item.latencyMs === 0)
+        .slice(-180),
+      activity: {
+        topologyChanges: market.topologyChanges,
+        hashActivity: market.hashActivity,
+      },
       recentObservations: [...market.recent].reverse(),
       note: 'All economics and fills are recorder outputs. The observer does not infer maker fills or recompute execution.',
     };
@@ -806,14 +993,14 @@ export function mountShadowObserver(app: Express, options: ShadowObserverOptions
   app.use(prefix, (req: Request, res: Response, next) => {
     res.setHeader('Cache-Control', 'no-store');
     res.setHeader('X-Content-Type-Options', 'nosniff');
-    res.setHeader('Content-Security-Policy', "default-src 'self'; connect-src 'self'; img-src 'self' data:; style-src 'unsafe-inline'; script-src 'unsafe-inline'; frame-ancestors 'none'");
+    res.setHeader('Content-Security-Policy', "default-src 'self'; connect-src 'self'; img-src 'self' data:; style-src 'unsafe-inline'; script-src 'unsafe-inline' https://cdn.jsdelivr.net; frame-ancestors 'none'");
     if (!['GET', 'HEAD'].includes(req.method)) {
       res.status(405).json({ error: 'READ_ONLY_OBSERVER' });
       return;
     }
     next();
   });
-  app.get(prefix, (_req, res) => res.type('html').send(observerHtml(prefix)));
+  app.get(prefix, (_req, res) => res.type('html').send(shadowObserverHtml(prefix)));
   app.get(`${prefix}/api/snapshot`, (_req, res) => {
     try {
       res.json(reader.snapshot());
